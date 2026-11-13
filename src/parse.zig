@@ -1,10 +1,18 @@
-//! Parser for the Perl-style syntax family. Two dialects share one parser:
+//! Parser for the Perl-style syntax family. Three dialects share one parser:
 //!
 //!   * .perl       — Perl/PCRE flavour: `^`/`$` match at text boundaries unless
 //!                   (?m); (?s) lets `.` match '\n'; `\h` is horizontal space.
 //!   * .oniguruma  — Oniguruma "Ruby" flavour as used by Sublime syntaxes:
 //!                   `^`/`$` are always line anchors; (?m) lets `.` match '\n';
 //!                   `\h` is a hex digit; `{,n}` is accepted.
+//!   * .posix_ere  — POSIX extended expressions with the GNU `\w \W \s \S \b \B`
+//!                   and back-references: `.` matches '\n', `^`/`$` are text
+//!                   anchors, a quantifier may follow a quantifier (`a*?` is
+//!                   `(a*)?`, never lazy), `(?` has no meaning, a backslash in
+//!                   a bracket expression is a literal, and any other escape
+//!                   stands for the character itself. Matching is still
+//!                   leftmost-first, so the span of a match may differ from a
+//!                   leftmost-longest engine; whether a match exists does not.
 //!
 //! Matching is byte-based for now: a pattern byte >= 0x80 is a literal byte,
 //! and `.` and negated classes consume one byte. Unicode properties (\p{..})
@@ -16,7 +24,7 @@ const ByteSet = @import("byteset.zig").ByteSet;
 
 const Node = ast.Node;
 
-pub const Dialect = enum { perl, oniguruma };
+pub const Dialect = enum { perl, oniguruma, posix_ere };
 
 pub const Limits = struct {
     max_pattern_len: usize = 64 * 1024,
@@ -231,7 +239,10 @@ const Parser = struct {
             if (count > 0 and p.dialect == .perl)
                 return p.fail(error.InvalidPattern, qpos, "nested quantifier");
             var greed: ast.Greed = .greedy;
-            if (p.eat('?')) {
+            if (p.dialect == .posix_ere) {
+                // No lazy or possessive forms: a following `?` or `+` is
+                // another quantifier, read on the next turn of the loop.
+            } else if (p.eat('?')) {
                 greed = .lazy;
             } else if (p.peek() == '+' and !(q.braces and p.dialect == .oniguruma)) {
                 p.pos += 1;
@@ -300,7 +311,7 @@ const Parser = struct {
         // and keeps its effect until the enclosing group closes.
         const saved = p.flags;
 
-        if (!p.eat('?')) {
+        if (p.dialect == .posix_ere or !p.eat('?')) {
             p.group_count += 1;
             return p.finishGroup(open, .{ .capture = p.group_count }, saved);
         }
@@ -382,11 +393,11 @@ const Parser = struct {
                 'x' => f.extended = on,
                 // m and s swap meaning between the dialects.
                 'm' => switch (p.dialect) {
-                    .perl => f.line_anchors = on,
+                    .perl, .posix_ere => f.line_anchors = on,
                     .oniguruma => f.dot_all = on,
                 },
                 's' => switch (p.dialect) {
-                    .perl => f.dot_all = on,
+                    .perl, .posix_ere => f.dot_all = on,
                     .oniguruma => return p.fail(error.InvalidPattern, p.pos - 1, "unknown flag 's' in Oniguruma syntax"),
                 },
                 ')' => {
@@ -443,7 +454,7 @@ const Parser = struct {
                     s.addRange('a', 'f');
                     s.addRange('A', 'F');
                 },
-                .perl => {
+                .perl, .posix_ere => {
                     s.add(' ');
                     s.add('\t');
                 },
@@ -506,6 +517,7 @@ const Parser = struct {
         const c = p.peek() orelse return p.fail(error.InvalidPattern, at, "pattern ends with a backslash");
         p.pos += 1;
 
+        if (p.dialect == .posix_ere) return p.posixEscape(c, at);
         if (p.classEscape(c)) |s| return try p.node(.{ .set = s });
         switch (c) {
             'b' => return try p.node(.{ .assertion = .word_boundary }),
@@ -546,6 +558,26 @@ const Parser = struct {
         }
         if (try p.byteEscape(c, at)) |b| return try p.literal(b);
         return p.fail(error.InvalidPattern, at, "unknown escape sequence");
+    }
+
+    /// An escape in POSIX ERE (GNU flavour): word and space classes, word
+    /// boundaries and back-references; anything else is the character itself.
+    fn posixEscape(p: *Parser, c: u8, at: usize) Error!*const Node {
+        switch (c) {
+            'w', 'W', 's', 'S' => return try p.node(.{ .set = p.classEscape(c).? }),
+            'b' => return try p.node(.{ .assertion = .word_boundary }),
+            'B' => return try p.node(.{ .assertion = .not_word_boundary }),
+            '<', '>' => return p.fail(error.Unsupported, at, "word-start and word-end anchors \\< and \\>"),
+            '1'...'9' => {
+                const n: u32 = c - '0';
+                if (n > p.max_backref) {
+                    p.max_backref = n;
+                    p.backref_pos = at;
+                }
+                return try p.node(.{ .backref = .{ .index = n, .ignore_case = p.flags.ignore_case } });
+            },
+            else => return try p.literal(c),
+        }
     }
 
     // ---- character classes ----------------------------------------------
@@ -612,7 +644,8 @@ const Parser = struct {
     fn classItem(p: *Parser, set: *ByteSet) Error!?u8 {
         const c = p.src[p.pos];
         p.pos += 1;
-        if (c != '\\') return c;
+        // In a POSIX bracket expression a backslash is an ordinary character.
+        if (c != '\\' or p.dialect == .posix_ere) return c;
         const at = p.pos - 1;
         const e = p.peek() orelse return p.fail(error.InvalidPattern, at, "pattern ends with a backslash");
         p.pos += 1;
@@ -703,7 +736,7 @@ pub fn parse(
         .src = pattern,
         .dialect = dialect,
         .limits = limits,
-        .flags = .{ .ignore_case = ignore_case, .line_anchors = dialect == .oniguruma },
+        .flags = .{ .ignore_case = ignore_case, .line_anchors = dialect == .oniguruma, .dot_all = dialect == .posix_ere },
         .diag = diag,
     };
     const root = try p.parseAlt();

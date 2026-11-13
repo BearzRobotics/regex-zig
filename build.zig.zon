@@ -1,7 +1,7 @@
 .{
     .name = .regex,
     .fingerprint = 0x4204f8ca9fc86b6d,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .minimum_zig_version = "0.17.0",
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

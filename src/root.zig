@@ -1,8 +1,8 @@
 //! regex-zig: a pure-Zig regular-expression library (see SPEC.md).
 //!
-//! Current state: the Perl/Oniguruma-style parser and the bounded
-//! backtracking engine. POSIX BRE/ERE, the Rust dialect, the linear-time
-//! engine, UTF-8 and streaming are not implemented yet.
+//! Current state: the Perl, Oniguruma and POSIX ERE parsers and the bounded
+//! backtracking engine. POSIX BRE, the Rust dialect, the linear-time engine,
+//! UTF-8 and streaming are not implemented yet.
 
 const std = @import("std");
 const parse = @import("parse.zig");

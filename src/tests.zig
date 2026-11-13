@@ -292,3 +292,31 @@ test "first-byte prefilter never skips a valid match" {
     try expectSpan("^$", "", .{ 0, 0 });
     try expectSpan("a|b|", "zz", .{ 0, 0 });
 }
+
+test "posix_ere dialect" {
+    const ere: regex.Options = .{ .dialect = .posix_ere };
+    // Basics shared with the other dialects.
+    try expectSpanOpts("a(b|c)+d", "xabcbd", .{ 1, 6 }, ere);
+    try expectSpanOpts("^[[:alpha:]]+$", "Hello", .{ 0, 5 }, ere);
+    try expectSpanOpts("a{2,3}", "caaaa", .{ 1, 4 }, ere);
+    // `.` matches a newline; anchors are text anchors.
+    try expectSpanOpts("a.b", "a\nb", .{ 0, 3 }, ere);
+    try expectSpanOpts("^b", "a\nb", null, ere);
+    // `*?` is `(*)?`: greedy, not lazy.
+    try expectSpanOpts("a*?", "aaa", .{ 0, 3 }, ere);
+    try expectSpanOpts("a+?b", "aab", .{ 0, 3 }, ere);
+    // `(?` has no meaning in ERE.
+    try std.testing.expectError(error.InvalidPattern, regex.Regex.compile(gpa, "(?:a)", ere, null));
+    // GNU escapes; others are the character itself.
+    try expectSpanOpts("\\w+", "  ab_1 ", .{ 2, 6 }, ere);
+    try expectSpanOpts("\\bfoo\\b", "a foo b", .{ 2, 5 }, ere);
+    try expectSpanOpts("a\\.b", "a.b", .{ 0, 3 }, ere);
+    try expectSpanOpts("\\d", "d", .{ 0, 1 }, ere);
+    try expectSpanOpts("\\d", "5", null, ere);
+    try expectSpanOpts("(a)\\1", "xaa", .{ 1, 3 }, ere);
+    // A backslash in a bracket expression is a literal.
+    try expectSpanOpts("[\\d]+", "5\\d", .{ 1, 3 }, ere);
+    try std.testing.expectError(error.Unsupported, regex.Regex.compile(gpa, "\\<a", ere, null));
+    // Case folding applies as in the other dialects.
+    try expectSpanOpts("COPY", "a copy", .{ 2, 6 }, .{ .dialect = .posix_ere, .ignore_case = true });
+}
