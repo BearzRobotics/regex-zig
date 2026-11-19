@@ -8,6 +8,8 @@ const program = @import("program.zig");
 const parse = @import("parse.zig");
 const ByteSet = @import("byteset.zig").ByteSet;
 const ops = @import("ops.zig");
+const context = @import("context.zig");
+const pike = @import("pike.zig");
 const utf8 = @import("utf8.zig");
 const unicode = @import("unicode.zig");
 
@@ -61,6 +63,11 @@ pub const Searcher = struct {
     prog: Program,
     limits: parse.Limits,
     regs: []usize,
+    /// Leftmost-longest mode: the longest match found so far from this start.
+    best: []usize = &.{},
+    have_best: bool = false,
+    /// The Pike VM, when the program was compiled for it (see Program.engine).
+    pike: ?pike.Pike = null,
     stack: std.ArrayList(Frame) = .empty,
     steps: u64 = 0,
     /// Position recorded by the marker most recently removed by cutToMarker.
@@ -74,22 +81,30 @@ pub const Searcher = struct {
     pub const replaceAll = ops.replaceAll;
 
     pub fn init(gpa: std.mem.Allocator, prog: Program, limits: parse.Limits) !Searcher {
-        return .{
-            .gpa = gpa,
-            .prog = prog,
-            .limits = limits,
-            .regs = try gpa.alloc(usize, prog.reg_count),
-        };
+        const regs = try gpa.alloc(usize, prog.reg_count);
+        errdefer gpa.free(regs);
+        var best: []usize = &.{};
+        if (prog.longest and prog.engine == .backtrack) best = try gpa.alloc(usize, prog.reg_count);
+        errdefer if (best.len > 0) gpa.free(best);
+        var vm: ?pike.Pike = null;
+        if (prog.engine == .pike) vm = try pike.Pike.init(gpa, prog);
+        return .{ .gpa = gpa, .prog = prog, .limits = limits, .regs = regs, .best = best, .pike = vm };
     }
 
     pub fn deinit(s: *Searcher) void {
         s.gpa.free(s.regs);
+        if (s.best.len > 0) s.gpa.free(s.best);
+        if (s.pike) |*vm| vm.deinit();
         s.stack.deinit(s.gpa);
     }
 
     /// Leftmost match at or after `from`. The returned Match borrows the
     /// searcher's registers and is valid until the next call.
     pub fn find(s: *Searcher, hay: []const u8, from: usize) MatchError!?Match {
+        if (s.pike) |*vm| {
+            const regs = vm.find(hay, from) orelse return null;
+            return .{ .regs = regs };
+        }
         s.steps = 0;
         var start = from;
         const first = s.prog.first_bytes;
@@ -158,7 +173,16 @@ pub const Searcher = struct {
         return marker.kind;
     }
 
+    /// Leftmost-longest mode, after the search from one start is exhausted:
+    /// the best match found, if any.
+    fn finishRun(s: *Searcher) bool {
+        if (!s.have_best) return false;
+        @memcpy(s.regs, s.best);
+        return true;
+    }
+
     fn run(s: *Searcher, hay: []const u8, start: usize, search_start: usize) MatchError!bool {
+        s.have_best = false;
         const insts = s.prog.insts;
         var pc: u32 = 0;
         var pos = start;
@@ -191,7 +215,7 @@ pub const Searcher = struct {
                 } else {
                     ok = false;
                 },
-                .cp_class => |i| if (decodeAt(hay, pos)) |d| {
+                .cp_class => |i| if (context.decodeAt(hay, pos)) |d| {
                     if (utf8.containsRange(s.prog.cp_sets[i], d.cp)) {
                         pos += d.len;
                         pc += 1;
@@ -208,7 +232,7 @@ pub const Searcher = struct {
                     try s.setReg(r, pos);
                     pc += 1;
                 },
-                .assertion => |a| if (check(a, hay, pos, search_start, s.prog.utf8)) {
+                .assertion => |a| if (context.check(a, hay, pos, search_start, s.prog.utf8)) {
                     pc += 1;
                 } else {
                     ok = false;
@@ -260,63 +284,19 @@ pub const Searcher = struct {
                     pc += 1;
                 },
                 .loop_end => |l| pc = if (s.regs[l.slot] == pos) pc + 1 else l.target,
-                .match => return true,
+                .match => if (s.prog.longest) {
+                    // Keep the longest; go on exploring the other alternatives.
+                    if (!s.have_best or s.regs[1] > s.best[1]) {
+                        @memcpy(s.best, s.regs);
+                        s.have_best = true;
+                    }
+                    ok = false;
+                } else return true,
             }
-            if (!ok) pc = s.backtrack(&pos) orelse return false;
+            if (!ok) pc = s.backtrack(&pos) orelse return s.finishRun();
         }
     }
 };
-
-fn check(a: @import("ast.zig").Assertion, hay: []const u8, pos: usize, search_start: usize, utf8_mode: bool) bool {
-    return switch (a) {
-        .line_start => pos == 0 or hay[pos - 1] == '\n',
-        .line_end => pos == hay.len or hay[pos] == '\n',
-        .text_start => pos == 0,
-        .text_end => pos == hay.len,
-        .text_end_or_final_newline => pos == hay.len or (pos + 1 == hay.len and hay[pos] == '\n'),
-        .word_boundary => wordBefore(hay, pos, utf8_mode) != wordAfter(hay, pos, utf8_mode),
-        .not_word_boundary => wordBefore(hay, pos, utf8_mode) == wordAfter(hay, pos, utf8_mode),
-        .search_start => pos == search_start,
-    };
-}
-
-const Decoded = struct { cp: u21, len: u3 };
-
-/// The well-formed UTF-8 character starting at `pos`, or null (end of input,
-/// or an invalid or truncated sequence).
-fn decodeAt(hay: []const u8, pos: usize) ?Decoded {
-    if (pos >= hay.len) return null;
-    const b = hay[pos];
-    if (b < 0x80) return .{ .cp = b, .len = 1 };
-    const len = std.unicode.utf8ByteSequenceLength(b) catch return null;
-    if (hay.len - pos < len) return null;
-    const cp = std.unicode.utf8Decode(hay[pos..][0..len]) catch return null;
-    return .{ .cp = cp, .len = len };
-}
-
-/// The well-formed character that ends exactly at `pos`, if there is one.
-fn decodeBefore(hay: []const u8, pos: usize) ?Decoded {
-    if (pos == 0) return null;
-    var start = pos - 1;
-    // A character is at most 4 bytes: step back over continuation bytes.
-    while (start > 0 and pos - start < 4 and hay[start] & 0xC0 == 0x80) start -= 1;
-    const d = decodeAt(hay, start) orelse return null;
-    return if (start + d.len == pos) d else null;
-}
-
-fn wordBefore(hay: []const u8, pos: usize, utf8_mode: bool) bool {
-    if (pos == 0) return false;
-    if (!utf8_mode or hay[pos - 1] < 0x80) return ByteSet.isWordByte(hay[pos - 1]);
-    const d = decodeBefore(hay, pos) orelse return false;
-    return unicode.isWord(d.cp);
-}
-
-fn wordAfter(hay: []const u8, pos: usize, utf8_mode: bool) bool {
-    if (pos >= hay.len) return false;
-    if (!utf8_mode or hay[pos] < 0x80) return ByteSet.isWordByte(hay[pos]);
-    const d = decodeAt(hay, pos) orelse return false;
-    return unicode.isWord(d.cp);
-}
 
 /// Length of the text at `pos` that equals the captured text hay[a..e], or
 /// null. Case-insensitive comparison in utf8 mode works on characters (simple
@@ -330,8 +310,8 @@ fn backrefLen(hay: []const u8, a: usize, e: usize, pos: usize, ignore_case: bool
     var i = a;
     var j = pos;
     while (i < e) {
-        const x = decodeAt(hay, i);
-        const y = decodeAt(hay, j);
+        const x = context.decodeAt(hay, i);
+        const y = context.decodeAt(hay, j);
         if (x != null and y != null and i + x.?.len <= e) {
             if (!unicode.eqlFold(x.?.cp, y.?.cp)) return null;
             i += x.?.len;

@@ -20,8 +20,23 @@ fn span(pattern: []const u8, hay: []const u8, opts: regex.Options) !?[2]usize {
     defer re.deinit(gpa);
     var s = try re.searcher(gpa);
     defer s.deinit();
-    const m = (try s.find(hay, 0)) orelse return null;
-    return .{ m.start(), m.end() };
+    const m = (try s.find(hay, 0)) orelse null;
+    const got: ?[2]usize = if (m) |mm| .{ mm.start(), mm.end() } else null;
+
+    // Every behaviour test doubles as a differential test: when the default
+    // engine is the Pike VM, the backtracker must give the same span.
+    if (opts.engine == .auto and re.prog.engine == .pike) {
+        var bo = opts;
+        bo.engine = .backtrack;
+        var bre = try regex.Regex.compile(gpa, pattern, bo, null);
+        defer bre.deinit(gpa);
+        var bs = try bre.searcher(gpa);
+        defer bs.deinit();
+        const bm = try bs.find(hay, 0);
+        const bgot: ?[2]usize = if (bm) |mm| .{ mm.start(), mm.end() } else null;
+        try std.testing.expectEqual(bgot, got);
+    }
+    return got;
 }
 
 fn expectSpan(pattern: []const u8, hay: []const u8, want: ?[2]usize) !void {
@@ -201,15 +216,15 @@ test "high bytes are literal and never crash" {
     try expectSpan("a", "\xff\xfe", null);
 }
 
-test "pathological patterns hit the step limit instead of hanging" {
-    var re = try regex.Regex.compile(gpa, "(a*)*b", .{ .limits = .{ .max_steps = 100_000 } }, null);
+test "pathological patterns hit the backtracker step limit instead of hanging" {
+    var re = try regex.Regex.compile(gpa, "(a*)*b", .{ .engine = .backtrack, .limits = .{ .max_steps = 100_000 } }, null);
     defer re.deinit(gpa);
     var s = try re.searcher(gpa);
     defer s.deinit();
     // Nested quantifiers are exponential in a backtracker; the budget stops it.
     try std.testing.expectError(error.StepLimitExceeded, s.find("aaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0));
 
-    var re2 = try regex.Regex.compile(gpa, "(a+)+b", .{ .limits = .{ .max_steps = 100_000 } }, null);
+    var re2 = try regex.Regex.compile(gpa, "(a+)+b", .{ .engine = .backtrack, .limits = .{ .max_steps = 100_000 } }, null);
     defer re2.deinit(gpa);
     var s2 = try re2.searcher(gpa);
     defer s2.deinit();
@@ -217,7 +232,7 @@ test "pathological patterns hit the step limit instead of hanging" {
 }
 
 test "stack limit is enforced" {
-    var re = try regex.Regex.compile(gpa, ".*x", .{ .limits = .{ .max_stack = 64 } }, null);
+    var re = try regex.Regex.compile(gpa, ".*x", .{ .engine = .backtrack, .limits = .{ .max_stack = 64 } }, null);
     defer re.deinit(gpa);
     var s = try re.searcher(gpa);
     defer s.deinit();
@@ -731,18 +746,20 @@ test "utf8: without the tables case folding is ASCII-only" {
 
 // ---- pathological patterns -----------------------------------------------------
 
-// BASELINE for the backtracking engine only. SPEC section 2 goal 2 requires
-// linear time for patterns without back-references or look-around: once the
-// linear-time engine exists these must return "no match" quickly, and these
-// expectations must be replaced (not loosened).
-test "pathological patterns: backtracker stops at the step limit" {
-    const cases = [_]struct { pattern: []const u8, unit: u8, n: usize, tail: []const u8 }{
-        .{ .pattern = "(a*)*b", .unit = 'a', .n = 30, .tail = "" },
-        .{ .pattern = "(a+)+$", .unit = 'a', .n = 30, .tail = "!" },
-        .{ .pattern = "(a|aa)+$", .unit = 'a', .n = 40, .tail = "!" },
-        .{ .pattern = "(x+x+)+y", .unit = 'x', .n = 40, .tail = "" },
-    };
-    for (cases) |c| {
+// SPEC section 2 goal 2: patterns without back-references or look-around run
+// in linear time. With the default engine these finish quickly with the
+// right answer; the backtracker, forced, still stops at its step limit.
+const pathological = [_]struct { pattern: []const u8, unit: u8, n: usize, tail: []const u8 }{
+    .{ .pattern = "(a*)*b", .unit = 'a', .n = 30, .tail = "" },
+    .{ .pattern = "(a+)+$", .unit = 'a', .n = 30, .tail = "!" },
+    .{ .pattern = "(a|aa)+$", .unit = 'a', .n = 40, .tail = "!" },
+    .{ .pattern = "(x+x+)+y", .unit = 'x', .n = 40, .tail = "" },
+    .{ .pattern = "(a?){30}a{30}", .unit = 'a', .n = 29, .tail = "" },
+    .{ .pattern = "(a*)*b", .unit = 'a', .n = 100_000, .tail = "" },
+};
+
+test "pathological patterns run in linear time with the default engine" {
+    for (pathological) |c| {
         const body = try gpa.alloc(u8, c.n);
         defer gpa.free(body);
         @memset(body, c.unit);
@@ -752,17 +769,229 @@ test "pathological patterns: backtracker stops at the step limit" {
         defer re.deinit(gpa);
         var s = try re.searcher(gpa);
         defer s.deinit();
+        // None of these match; the point is that the answer comes back.
+        try std.testing.expect((try s.find(hay, 0)) == null);
+    }
+    // And one that does match: (a+)+$ on a run of a's.
+    var re = try regex.Regex.compile(gpa, "(a+)+$", .{}, null);
+    defer re.deinit(gpa);
+    var s = try re.searcher(gpa);
+    defer s.deinit();
+    const hay = try repeated("a", 50_000);
+    defer gpa.free(hay);
+    const m = (try s.find(hay, 0)).?;
+    try std.testing.expectEqual(@as(usize, 50_000), m.end());
+}
+
+test "pathological patterns: the backtracker still stops at its step limit" {
+    for (pathological[0..4]) |c| {
+        const body = try gpa.alloc(u8, c.n);
+        defer gpa.free(body);
+        @memset(body, c.unit);
+        const hay = try std.mem.concat(gpa, u8, &.{ body, c.tail });
+        defer gpa.free(hay);
+        var re = try regex.Regex.compile(gpa, c.pattern, .{ .engine = .backtrack }, null);
+        defer re.deinit(gpa);
+        var s = try re.searcher(gpa);
+        defer s.deinit();
         try std.testing.expectError(error.StepLimitExceeded, s.find(hay, 0));
     }
 }
 
-test "step budget is per find call, so a long scan can exceed it" {
-    // BASELINE: documents a weakness the linear-time engine removes.
+test "a long scan is not limited by the step budget with the default engine" {
     const hay = try repeated("the quick brown fox ", 100_000);
     defer gpa.free(hay);
     var re = try regex.Regex.compile(gpa, "[a-z]+@", .{}, null);
     defer re.deinit(gpa);
     var s = try re.searcher(gpa);
     defer s.deinit();
-    try std.testing.expectError(error.StepLimitExceeded, s.find(hay, 0));
+    try std.testing.expect((try s.find(hay, 0)) == null);
+    // The backtracker's budget is per find call, so the same scan exceeds it.
+    var bt = try regex.Regex.compile(gpa, "[a-z]+@", .{ .engine = .backtrack }, null);
+    defer bt.deinit(gpa);
+    var bs = try bt.searcher(gpa);
+    defer bs.deinit();
+    try std.testing.expectError(error.StepLimitExceeded, bs.find(hay, 0));
+}
+
+// ---- engines: leftmost-longest, forced engines, differential --------------------
+
+test "posix_ere is leftmost-longest" {
+    const ere: regex.Options = .{ .dialect = .posix_ere };
+    // Leftmost-first would pick "a"; POSIX picks the longest alternative.
+    try expectSpanOpts("a|ab", "abc", .{ 0, 2 }, ere);
+    try expectSpanOpts("(a|ab)(c|bcd)", "abcd", .{ 0, 4 }, ere);
+    try expectSpanOpts("a*", "aaa", .{ 0, 3 }, ere);
+    try expectSpanOpts("x*|y", "yyy", .{ 0, 1 }, ere); // at start 0 the longest of "" and "y" is "y"
+    try expectSpanOpts("a|ab", "abc", .{ 0, 1 }, .{}); // perl dialects stay leftmost-first
+    // With a back-reference the backtracker is used and is leftmost-longest too.
+    try expectSpanOpts("(a|ab)\\1", "abab", .{ 0, 4 }, ere);
+    try expectSpanOpts("(a|ab)(b?)\\2", "abb", .{ 0, 3 }, ere);
+}
+
+test "the engine is chosen from the pattern, and can be forced" {
+    var plain = try regex.Regex.compile(gpa, "a(b|c)*d", .{}, null);
+    defer plain.deinit(gpa);
+    try std.testing.expect(plain.prog.engine == .pike);
+
+    for ([_][]const u8{ "(a)\\1", "a(?=b)", "(?<=a)b", "(?>a+)b", "a++b" }) |needs_bt| {
+        var re = try regex.Regex.compile(gpa, needs_bt, .{}, null);
+        defer re.deinit(gpa);
+        try std.testing.expect(re.prog.engine == .backtrack);
+        try expectCompileError(needs_bt, .{ .engine = .pike }, error.Unsupported);
+    }
+    var forced = try regex.Regex.compile(gpa, "a(b|c)*d", .{ .engine = .backtrack }, null);
+    defer forced.deinit(gpa);
+    try std.testing.expect(forced.prog.engine == .backtrack);
+}
+
+test "a pattern too large for the Pike VM falls back to the backtracker" {
+    if (!unicode.enabled) return error.SkipZigTest;
+    // \p{L}{40} is about 40 copies of a class of several thousand instructions.
+    const opts: regex.Options = .{ .utf8 = true, .limits = .{ .max_program_len = 20_000 } };
+    var re = try regex.Regex.compile(gpa, "\\p{L}{40}", opts, null);
+    defer re.deinit(gpa);
+    try std.testing.expect(re.prog.engine == .backtrack);
+    try expectCompileError("\\p{L}{40}", .{ .utf8 = true, .engine = .pike, .limits = .{ .max_program_len = 20_000 } }, error.LimitExceeded);
+}
+
+const Oom = error{OutOfMemory};
+
+const Gen = struct {
+    r: std.Random,
+    out: std.ArrayList(u8) = .empty,
+    ere: bool,
+    /// A quantifier was applied to something containing a group: capture
+    /// positions may legitimately differ between the engines then.
+    quantified_group: bool = false,
+
+    fn put(g: *Gen, s: []const u8) Oom!void {
+        try g.out.appendSlice(gpa, s);
+    }
+
+    fn alt(g: *Gen, depth: u32) Oom!void {
+        try g.concat(depth);
+        if (g.r.uintLessThan(u8, 4) == 0) {
+            try g.put("|");
+            try g.concat(depth);
+        }
+    }
+
+    fn concat(g: *Gen, depth: u32) Oom!void {
+        const n = g.r.intRangeAtMost(u8, 1, 3);
+        for (0..n) |_| try g.piece(depth);
+    }
+
+    fn piece(g: *Gen, depth: u32) Oom!void {
+        const has_group = try g.atom(depth);
+        if (g.r.uintLessThan(u8, 3) != 0) return;
+        const quants = [_][]const u8{ "*", "+", "?", "{1,2}", "{2}", "{0,2}" };
+        try g.put(quants[g.r.uintLessThan(usize, quants.len)]);
+        if (!g.ere and g.r.uintLessThan(u8, 3) == 0) try g.put("?");
+        if (has_group) g.quantified_group = true;
+    }
+
+    /// Returns true if the atom contains a capture group.
+    fn atom(g: *Gen, depth: u32) Oom!bool {
+        switch (g.r.uintLessThan(u8, 12)) {
+            0, 1, 2, 3 => try g.put(&.{"abc"[g.r.uintLessThan(usize, 3)]}),
+            4 => try g.put("."),
+            5 => try g.put(if (g.r.boolean()) "[ab]" else "[^a]"),
+            6, 7 => if (depth > 0) {
+                try g.put("(");
+                try g.alt(depth - 1);
+                try g.put(")");
+                return true;
+            } else try g.put("a"),
+            8 => if (depth > 0 and !g.ere) {
+                try g.put("(?:");
+                try g.alt(depth - 1);
+                try g.put(")");
+            } else try g.put("b"),
+            9 => try g.put(if (g.r.boolean()) "^" else "$"),
+            10 => try g.put("\\b"),
+            else => try g.put("c"),
+        }
+        return false;
+    }
+};
+
+fn expectSameResult(pattern: []const u8, opts: regex.Options, compare_groups: bool, hay: []const u8) !void {
+    var po = opts;
+    po.engine = .pike;
+    var bo = opts;
+    bo.engine = .backtrack;
+    var pre = try regex.Regex.compile(gpa, pattern, po, null);
+    defer pre.deinit(gpa);
+    var bre = try regex.Regex.compile(gpa, pattern, bo, null);
+    defer bre.deinit(gpa);
+    var ps = try pre.searcher(gpa);
+    defer ps.deinit();
+    var bs = try bre.searcher(gpa);
+    defer bs.deinit();
+
+    // Every match of an iteration, so empty matches and from > 0 are covered.
+    var pit = ps.matches(hay);
+    var bit = bs.matches(hay);
+    while (true) {
+        const pm = try pit.next();
+        const bm = try bit.next();
+        if (pm == null or bm == null) {
+            if ((pm == null) != (bm == null)) {
+                std.debug.print("MISMATCH pattern={s} hay={any} (pike null={}, backtrack null={})\n", .{ pattern, hay, pm == null, bm == null });
+                return error.TestUnexpectedResult;
+            }
+            break;
+        }
+        if (pm.?.start() != bm.?.start() or pm.?.end() != bm.?.end()) {
+            std.debug.print("MISMATCH pattern={s} hay={s} pike={d}..{d} backtrack={d}..{d}\n", .{ pattern, hay, pm.?.start(), pm.?.end(), bm.?.start(), bm.?.end() });
+            return error.TestUnexpectedResult;
+        }
+        if (compare_groups) {
+            var g: u32 = 1;
+            while (g <= pre.groupCount()) : (g += 1) {
+                const a = pm.?.group(g);
+                const b = bm.?.group(g);
+                if (!std.meta.eql(a, b)) {
+                    std.debug.print("GROUP MISMATCH pattern={s} hay={s} group={d}\n", .{ pattern, hay, g });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+}
+
+test "differential: the Pike VM agrees with the backtracker on random patterns" {
+    var prng = std.Random.DefaultPrng.init(0xd1ff);
+    const r = prng.random();
+    const alphabet = "abc\n";
+    var compared: usize = 0;
+    for ([_]regex.Dialect{ .perl, .posix_ere }) |dialect| {
+        for (0..1500) |_| {
+            var g: Gen = .{ .r = r, .ere = dialect == .posix_ere };
+            defer g.out.deinit(gpa);
+            try g.alt(2);
+            const opts: regex.Options = .{ .dialect = dialect };
+            // Skip anything the parser rejects (for example nested quantifiers in perl).
+            var probe = regex.Regex.compile(gpa, g.out.items, .{ .dialect = dialect, .engine = .pike }, null) catch continue;
+            probe.deinit(gpa);
+            for (0..6) |_| {
+                var hay: [12]u8 = undefined;
+                const len = r.uintLessThan(usize, hay.len + 1);
+                for (hay[0..len]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+                try expectSameResult(g.out.items, opts, !g.quantified_group, hay[0..len]);
+                compared += 1;
+            }
+        }
+    }
+    try std.testing.expect(compared > 5000);
+}
+
+test "differential: utf8 patterns agree between the engines" {
+    if (!unicode.enabled) return error.SkipZigTest;
+    const patterns = [_][]const u8{ ".", ".+", "[^a]+", "é+", "(?i)é+", "\\w+", "\\p{L}+", "\\p{Lu}\\p{Ll}*", "[à-ü]+", "\\b\\w+\\b", "☺|é", "(?i)straße|k+", "[^\\p{L}]+", "\\d+" };
+    const hays = [_][]const u8{ "", "abc é☺ Éa", "日本語 text", "\xff\x80é\xc3", "KkK\u{212A} ſs", "٣٤ 12", "😀x😀" };
+    for (patterns) |pat| {
+        for (hays) |h| try expectSameResult(pat, .{ .utf8 = true }, true, h);
+    }
 }

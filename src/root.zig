@@ -20,6 +20,7 @@ pub const Diagnostic = parse.Diagnostic;
 pub const MatchError = backtrack.MatchError;
 pub const Match = backtrack.Match;
 pub const Searcher = backtrack.Searcher;
+pub const Engine = program.Engine;
 pub const Span = ops.Span;
 pub const Matches = ops.Matches;
 pub const ReplaceError = ops.ReplaceError;
@@ -36,6 +37,10 @@ pub const Options = struct {
     /// covered (full case folding).
     utf8: bool = false,
     limits: Limits = .{},
+    /// Which engine runs the pattern. `.auto` picks the Pike VM (linear
+    /// time) unless the pattern needs the backtracker; `.backtrack` and
+    /// `.pike` force one, mainly for tests. See docs/decisions/0002-matching-engines.md.
+    engine: Engine = .auto,
 };
 
 /// A compiled pattern. Immutable after compile, so it may be shared between
@@ -51,7 +56,11 @@ pub const Regex = struct {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const parsed = try parse.parse(arena_state.allocator(), pattern, options.dialect, options.ignore_case, options.utf8, options.limits, d);
-        const prog = try program.compile(gpa, parsed, options.limits, options.utf8, d);
+        const prog = try program.compile(gpa, parsed, options.limits, .{
+            .utf8 = options.utf8,
+            .longest = options.dialect == .posix_ere,
+            .engine = options.engine,
+        }, d);
         return .{ .prog = prog, .limits = options.limits };
     }
 

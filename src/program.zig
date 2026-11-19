@@ -43,6 +43,34 @@ pub const Inst = union(enum) {
     match,
 };
 
+/// Which matching engine runs a pattern (docs/decisions/0002-matching-engines.md).
+pub const Engine = enum {
+    /// Pike VM when the pattern allows it, otherwise the backtracker.
+    auto,
+    backtrack,
+    pike,
+};
+
+/// What the compiler needs beyond the AST.
+pub const Settings = struct {
+    utf8: bool = false,
+    /// Leftmost-longest instead of leftmost-first (POSIX syntaxes).
+    longest: bool = false,
+    engine: Engine = .auto,
+};
+
+/// The byte-at-a-time program for the Pike VM: only `byte`, `any`, `any_nl`,
+/// `set`, `split`, `jmp`, `save`, `assertion` and `match` instructions.
+pub const Nfa = struct {
+    insts: []const Inst,
+    sets: []const ByteSet,
+
+    pub fn deinit(n: Nfa, gpa: std.mem.Allocator) void {
+        gpa.free(n.insts);
+        gpa.free(n.sets);
+    }
+};
+
 pub const Program = struct {
     insts: []const Inst,
     /// Bytes a match can start with, or null when the pattern can match the
@@ -56,8 +84,13 @@ pub const Program = struct {
     names: []const parse.Name,
     /// Matching is over UTF-8: start positions inside a character are skipped.
     utf8: bool,
+    longest: bool,
+    /// The engine `find` uses: .backtrack or .pike, never .auto.
+    engine: Engine,
+    nfa: ?Nfa,
 
     pub fn deinit(prog: Program, gpa: std.mem.Allocator) void {
+        if (prog.nfa) |n| n.deinit(gpa);
         gpa.free(prog.insts);
         gpa.free(prog.sets);
         for (prog.cp_sets) |s| gpa.free(s);
@@ -79,6 +112,8 @@ const Compiler = struct {
     loop_slots: u32 = 0,
     group_count: u32,
     utf8: bool,
+    /// Compile for the Pike VM (see Nfa) instead of the backtracker.
+    nfa: bool = false,
     depth: u32 = 0,
     diag: *parse.Diagnostic,
 
@@ -129,13 +164,18 @@ const Compiler = struct {
                 } else try c.compile(g.sub);
             },
             .atomic => |sub| {
+                if (c.nfa) return c.unsupported("atomic group needs the backtracking engine");
                 _ = try c.emit(.atomic_start);
                 try c.compile(sub);
                 _ = try c.emit(.atomic_end);
             },
             .look => |l| try c.compileLook(l),
             .assertion => |a| _ = try c.emit(.{ .assertion = a }),
-            .backref => |b| _ = try c.emit(.{ .backref = .{ .index = b.index, .ignore_case = b.ignore_case } }),
+            .backref => |b| if (c.nfa) {
+                return c.unsupported("back-reference needs the backtracking engine");
+            } else {
+                _ = try c.emit(.{ .backref = .{ .index = b.index, .ignore_case = b.ignore_case } });
+            },
         }
     }
 
@@ -156,6 +196,7 @@ const Compiler = struct {
     /// A set of scalar values as an alternation of UTF-8 byte sequences (see
     /// utf8.zig). The sequences are disjoint, so their order does not matter.
     fn emitRanges(c: *Compiler, ranges: []const utf8.CpRange) parse.Error!void {
+        if (c.nfa) return c.emitRangesNfa(ranges);
         var seqs: std.ArrayList(utf8.Sequence) = .empty;
         defer seqs.deinit(c.gpa);
         for (ranges) |r| try utf8.appendSequences(c.gpa, &seqs, r);
@@ -198,6 +239,50 @@ const Compiler = struct {
         for (jumps.items) |j| c.insts.items[j] = .{ .jmp = c.here() };
     }
 
+    /// NFA form of a character set: a trie over the byte ranges of the UTF-8
+    /// sequences, so sequences that share their first byte ranges share
+    /// instructions and the lead byte does not fan out into one thread per
+    /// sequence.
+    fn emitRangesNfa(c: *Compiler, ranges: []const utf8.CpRange) parse.Error!void {
+        var seqs: std.ArrayList(utf8.Sequence) = .empty;
+        defer seqs.deinit(c.gpa);
+        for (ranges) |r| try utf8.appendSequences(c.gpa, &seqs, r);
+        if (seqs.items.len == 0) {
+            try c.sets.append(c.gpa, .{});
+            _ = try c.emit(.{ .set = @intCast(c.sets.items.len - 1) });
+            return;
+        }
+        std.mem.sort(utf8.Sequence, seqs.items, {}, sequenceLessThan);
+        var ends: std.ArrayList(u32) = .empty;
+        defer ends.deinit(c.gpa);
+        try c.emitTrie(seqs.items, 0, &ends);
+        for (ends.items) |j| c.insts.items[j] = .{ .jmp = c.here() };
+    }
+
+    /// `seqs` is sorted and every member has the same first `depth` ranges.
+    /// UTF-8 sequences with equal first ranges have equal length, so no
+    /// sequence is a prefix of another.
+    fn emitTrie(c: *Compiler, seqs: []const utf8.Sequence, depth: u3, ends: *std.ArrayList(u32)) parse.Error!void {
+        var i: usize = 0;
+        while (i < seqs.len) {
+            const key = seqs[i].ranges[depth];
+            var j = i + 1;
+            while (j < seqs.len and std.meta.eql(seqs[j].ranges[depth], key)) j += 1;
+            const last = j == seqs.len;
+            var split: u32 = undefined;
+            if (!last) split = try c.emit(.{ .split = .{ .first = 0, .second = 0 } });
+            const body = c.here();
+            try c.emitByteRange(key);
+            if (seqs[i].len == depth + 1) {
+                try ends.append(c.gpa, try c.emit(.{ .jmp = 0 }));
+            } else {
+                try c.emitTrie(seqs[i..j], depth + 1, ends);
+            }
+            if (!last) c.insts.items[split] = .{ .split = .{ .first = body, .second = c.here() } };
+            i = j;
+        }
+    }
+
     fn emitByteRange(c: *Compiler, br: utf8.ByteRange) parse.Error!void {
         if (br.lo == br.hi) {
             _ = try c.emit(.{ .byte = br.lo });
@@ -237,6 +322,7 @@ const Compiler = struct {
     }
 
     fn compileLook(c: *Compiler, l: ast.Look) parse.Error!void {
+        if (c.nfa) return c.unsupported("look-around needs the backtracking engine");
         const start = try c.emit(.{ .look_start = .{ .negate = l.negate, .end = 0 } });
         if (l.ahead) {
             try c.compile(l.sub);
@@ -260,6 +346,7 @@ const Compiler = struct {
 
     fn compileRepeat(c: *Compiler, r: ast.Repeat) parse.Error!void {
         if (r.greed == .possessive) {
+            if (c.nfa) return c.unsupported("possessive quantifier needs the backtracking engine");
             _ = try c.emit(.atomic_start);
             try c.compileRepeatBody(r);
             _ = try c.emit(.atomic_end);
@@ -291,10 +378,31 @@ const Compiler = struct {
             return;
         }
 
+        if (c.nfa) {
+            // do-while shape: entry: split(body, exit); body; split(body, exit).
+            // When the body can match empty, an empty iteration reaches the
+            // exit at the priority the body had (as in Perl), where a jump
+            // back to the entry would be cut by the Pike VM's visited set and
+            // lose that path.
+            const entry = try c.emit(.{ .split = .{ .first = 0, .second = 0 } });
+            const body = c.here();
+            try c.compile(r.sub);
+            const again = try c.emit(.{ .split = .{ .first = 0, .second = 0 } });
+            const exit = c.here();
+            const order: @TypeOf(c.insts.items[entry].split) = if (lazy)
+                .{ .first = exit, .second = body }
+            else
+                .{ .first = body, .second = exit };
+            c.insts.items[entry] = .{ .split = order };
+            c.insts.items[again] = .{ .split = order };
+            return;
+        }
+
         // Unbounded tail: L: split(body, exit); body; jmp L; exit:
         const loop = try c.emit(.{ .split = .{ .first = 0, .second = 0 } });
         var slot: ?u32 = null;
-        if (canBeEmpty(r.sub)) {
+        // The Pike VM needs no guard: its visited set stops empty loops.
+        if (!c.nfa and canBeEmpty(r.sub)) {
             slot = 2 * (c.group_count + 1) + c.loop_slots;
             c.loop_slots += 1;
             _ = try c.emit(.{ .mark = slot.? });
@@ -311,6 +419,31 @@ const Compiler = struct {
             .{ .first = loop + 1, .second = exit } };
     }
 };
+
+fn sequenceLessThan(_: void, a: utf8.Sequence, b: utf8.Sequence) bool {
+    const n = @min(a.len, b.len);
+    for (a.ranges[0..n], b.ranges[0..n]) |x, y| {
+        if (x.lo != y.lo) return x.lo < y.lo;
+        if (x.hi != y.hi) return x.hi < y.hi;
+    }
+    return a.len < b.len;
+}
+
+/// True if the pattern uses something only the backtracker implements.
+fn needsBacktracker(n: *const ast.Node) bool {
+    return switch (n.*) {
+        .atomic, .look, .backref => true,
+        .empty, .byte, .any, .set, .cp_set, .assertion => false,
+        .concat => |items| for (items) |it| {
+            if (needsBacktracker(it)) break true;
+        } else false,
+        .alt => |alts| for (alts) |a| {
+            if (needsBacktracker(a)) break true;
+        } else false,
+        .repeat => |r| r.greed == .possessive or needsBacktracker(r.sub),
+        .group => |g| needsBacktracker(g.sub),
+    };
+}
 
 /// Width in bytes if every match of `n` has the same length.
 fn fixedWidth(n: *const ast.Node, utf8_mode: bool) ?u32 {
@@ -432,22 +565,72 @@ fn firstOf(n: *const ast.Node) First {
     }
 }
 
-/// Compile a parsed pattern. The returned Program owns gpa memory (and copies
-/// the group names out of the parser arena).
-pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limits, utf8_mode: bool, diag: *parse.Diagnostic) parse.Error!Program {
-    var c: Compiler = .{ .gpa = gpa, .limits = limits, .group_count = parsed.group_count, .utf8 = utf8_mode, .diag = diag };
+const Built = struct {
+    insts: []const Inst,
+    sets: []const ByteSet,
+    cp_sets: []const []const utf8.CpRange,
+    loop_slots: u32,
+};
+
+/// One compilation of the AST: for the backtracker (`nfa` false) or for the
+/// Pike VM. The caller owns the returned slices.
+fn build(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limits, utf8_mode: bool, nfa: bool, diag: *parse.Diagnostic) parse.Error!Built {
+    var c: Compiler = .{ .gpa = gpa, .limits = limits, .group_count = parsed.group_count, .utf8 = utf8_mode, .nfa = nfa, .diag = diag };
     errdefer c.insts.deinit(gpa);
     errdefer c.sets.deinit(gpa);
     errdefer {
         for (c.cp_sets.items) |s| gpa.free(s);
         c.cp_sets.deinit(gpa);
-        c.cp_sources.deinit(gpa);
     }
+    defer c.cp_sources.deinit(gpa);
 
-    _ = try c.emit(.{ .save = 0 }); // match start; also anchors \G-free scanning
+    _ = try c.emit(.{ .save = 0 }); // match start
     try c.compile(parsed.root);
     _ = try c.emit(.{ .save = 1 });
     _ = try c.emit(.match);
+
+    const insts = try c.insts.toOwnedSlice(gpa);
+    errdefer gpa.free(insts);
+    const sets = try c.sets.toOwnedSlice(gpa);
+    errdefer gpa.free(sets);
+    const cp_sets = try c.cp_sets.toOwnedSlice(gpa);
+    return .{ .insts = insts, .sets = sets, .cp_sets = cp_sets, .loop_slots = c.loop_slots };
+}
+
+/// Compile a parsed pattern. The returned Program owns gpa memory (and copies
+/// the group names out of the parser arena). The backtracker program is
+/// always built; the Pike VM program is built too when the pattern allows it
+/// and `settings.engine` is not `.backtrack`.
+pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limits, settings: Settings, diag: *parse.Diagnostic) parse.Error!Program {
+    const eligible = !needsBacktracker(parsed.root);
+    if (settings.engine == .pike and !eligible) {
+        diag.* = .{ .pos = 0, .message = "pattern needs the backtracking engine (back-reference, look-around, atomic group or possessive quantifier)" };
+        return error.Unsupported;
+    }
+
+    const bt = try build(gpa, parsed, limits, settings.utf8, false, diag);
+    errdefer {
+        gpa.free(bt.insts);
+        gpa.free(bt.sets);
+        for (bt.cp_sets) |s| gpa.free(s);
+        gpa.free(bt.cp_sets);
+    }
+
+    var nfa: ?Nfa = null;
+    errdefer if (nfa) |n| n.deinit(gpa);
+    if (eligible and settings.engine != .backtrack) {
+        if (build(gpa, parsed, limits, settings.utf8, true, diag)) |b| {
+            nfa = .{ .insts = b.insts, .sets = b.sets };
+            gpa.free(b.cp_sets);
+        } else |e| switch (e) {
+            // Too big for the Pike VM: fall back to the backtracker, unless
+            // the caller insisted.
+            error.LimitExceeded => if (settings.engine == .pike) return e else {
+                diag.* = .{};
+            },
+            else => return e,
+        }
+    }
 
     var names = try gpa.alloc(parse.Name, parsed.names.len);
     var done: usize = 0;
@@ -460,21 +643,18 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
         done = i + 1;
     }
 
-    const insts = try c.insts.toOwnedSlice(gpa);
-    errdefer gpa.free(insts);
-    const sets = try c.sets.toOwnedSlice(gpa);
-    errdefer gpa.free(sets);
-    const cp_sets = try c.cp_sets.toOwnedSlice(gpa);
-    c.cp_sources.deinit(gpa);
     const first = firstOf(parsed.root);
     return .{
-        .insts = insts,
+        .insts = bt.insts,
         .first_bytes = if (first.nullable) null else first.set,
-        .sets = sets,
-        .cp_sets = cp_sets,
+        .sets = bt.sets,
+        .cp_sets = bt.cp_sets,
         .group_count = parsed.group_count,
-        .reg_count = 2 * (parsed.group_count + 1) + c.loop_slots,
+        .reg_count = 2 * (parsed.group_count + 1) + bt.loop_slots,
         .names = names,
-        .utf8 = utf8_mode,
+        .utf8 = settings.utf8,
+        .longest = settings.longest,
+        .engine = if (nfa != null) .pike else .backtrack,
+        .nfa = nfa,
     };
 }
