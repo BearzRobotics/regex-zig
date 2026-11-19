@@ -2,8 +2,9 @@
 //!
 //! Current state: the Perl, Oniguruma and POSIX ERE parsers and the bounded
 //! backtracking engine, with isMatch/matches/count/findAll/split/replaceAll
-//! helpers on Searcher (ops.zig). POSIX BRE, the Rust dialect, the linear-time engine,
-//! UTF-8 and streaming are not implemented yet.
+//! helpers on Searcher (ops.zig), and phase 1 of UTF-8 matching (Options.utf8).
+//! POSIX BRE, the Rust dialect, the linear-time engine, Unicode properties and
+//! case folding, and streaming are not implemented yet.
 
 const std = @import("std");
 const parse = @import("parse.zig");
@@ -25,6 +26,11 @@ pub const ReplaceError = ops.ReplaceError;
 pub const Options = struct {
     dialect: Dialect = .perl,
     ignore_case: bool = false,
+    /// Match over UTF-8: the pattern must be valid UTF-8, and `.`, classes,
+    /// negation and `\x{...}` work on Unicode scalar values. Invalid UTF-8 in
+    /// the haystack never matches `.` or a class and never causes a crash.
+    /// See docs/decisions/0001-utf8-matching.md for what is not covered yet.
+    utf8: bool = false,
     limits: Limits = .{},
 };
 
@@ -40,8 +46,8 @@ pub const Regex = struct {
         const d = diag orelse &scratch;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
-        const parsed = try parse.parse(arena_state.allocator(), pattern, options.dialect, options.ignore_case, options.limits, d);
-        const prog = try program.compile(gpa, parsed, options.limits, d);
+        const parsed = try parse.parse(arena_state.allocator(), pattern, options.dialect, options.ignore_case, options.utf8, options.limits, d);
+        const prog = try program.compile(gpa, parsed, options.limits, options.utf8, d);
         return .{ .prog = prog, .limits = options.limits };
     }
 
@@ -62,5 +68,6 @@ pub const Regex = struct {
 
 test {
     _ = @import("byteset.zig");
+    _ = @import("utf8.zig");
     _ = @import("tests.zig");
 }

@@ -4,6 +4,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const parse = @import("parse.zig");
 const ByteSet = @import("byteset.zig").ByteSet;
+const utf8 = @import("utf8.zig");
 
 pub const unset = std.math.maxInt(usize);
 
@@ -45,6 +46,8 @@ pub const Program = struct {
     group_count: u32,
     reg_count: u32,
     names: []const parse.Name,
+    /// Matching is over UTF-8: start positions inside a character are skipped.
+    utf8: bool,
 
     pub fn deinit(prog: Program, gpa: std.mem.Allocator) void {
         gpa.free(prog.insts);
@@ -61,6 +64,7 @@ const Compiler = struct {
     sets: std.ArrayList(ByteSet) = .empty,
     loop_slots: u32 = 0,
     group_count: u32,
+    utf8: bool,
     depth: u32 = 0,
     diag: *parse.Diagnostic,
 
@@ -92,7 +96,10 @@ const Compiler = struct {
         switch (n.*) {
             .empty => {},
             .byte => |b| _ = try c.emit(.{ .byte = b }),
-            .any => |nl| _ = try c.emit(if (nl) .any_nl else .any),
+            .any => |nl| if (c.utf8) try c.compileAnyUtf8(nl) else {
+                _ = try c.emit(if (nl) .any_nl else .any);
+            },
+            .cp_set => |ranges| try c.emitRanges(ranges),
             .set => |s| {
                 try c.sets.append(c.gpa, s);
                 _ = try c.emit(.{ .set = @intCast(c.sets.items.len - 1) });
@@ -116,6 +123,66 @@ const Compiler = struct {
             .assertion => |a| _ = try c.emit(.{ .assertion = a }),
             .backref => |b| _ = try c.emit(.{ .backref = .{ .index = b.index, .ignore_case = b.ignore_case } }),
         }
+    }
+
+    /// `.` in utf8 mode: any scalar value, except '\n' unless `nl`.
+    fn compileAnyUtf8(c: *Compiler, nl: bool) parse.Error!void {
+        var ranges: std.ArrayList(utf8.CpRange) = .empty;
+        defer ranges.deinit(c.gpa);
+        if (nl) {
+            try ranges.append(c.gpa, .{ .lo = 0, .hi = utf8.max_scalar });
+        } else {
+            try ranges.append(c.gpa, .{ .lo = 0, .hi = '\n' - 1 });
+            try ranges.append(c.gpa, .{ .lo = '\n' + 1, .hi = utf8.max_scalar });
+        }
+        try utf8.normalize(c.gpa, &ranges);
+        try c.emitRanges(ranges.items);
+    }
+
+    /// A set of scalar values as an alternation of UTF-8 byte sequences (see
+    /// utf8.zig). The sequences are disjoint, so their order does not matter.
+    fn emitRanges(c: *Compiler, ranges: []const utf8.CpRange) parse.Error!void {
+        var seqs: std.ArrayList(utf8.Sequence) = .empty;
+        defer seqs.deinit(c.gpa);
+        for (ranges) |r| try utf8.appendSequences(c.gpa, &seqs, r);
+        if (seqs.items.len == 0) {
+            // An empty set never matches.
+            try c.sets.append(c.gpa, .{});
+            _ = try c.emit(.{ .set = @intCast(c.sets.items.len - 1) });
+            return;
+        }
+        var jumps: std.ArrayList(u32) = .empty;
+        defer jumps.deinit(c.gpa);
+        for (seqs.items, 0..) |seq, i| {
+            const last = i + 1 == seqs.items.len;
+            var split: u32 = undefined;
+            if (!last) split = try c.emit(.{ .split = .{ .first = 0, .second = 0 } });
+            const body = c.here();
+            for (seq.ranges[0..seq.len]) |br| try c.emitByteRange(br);
+            if (!last) {
+                try jumps.append(c.gpa, try c.emit(.{ .jmp = 0 }));
+                c.insts.items[split] = .{ .split = .{ .first = body, .second = c.here() } };
+            }
+        }
+        for (jumps.items) |j| c.insts.items[j] = .{ .jmp = c.here() };
+    }
+
+    fn emitByteRange(c: *Compiler, br: utf8.ByteRange) parse.Error!void {
+        if (br.lo == br.hi) {
+            _ = try c.emit(.{ .byte = br.lo });
+            return;
+        }
+        var s: ByteSet = .{};
+        s.addRange(br.lo, br.hi);
+        // Many sequences share the same continuation range (80-BF); reuse it.
+        for (c.sets.items, 0..) |existing, k| {
+            if (std.meta.eql(existing, s)) {
+                _ = try c.emit(.{ .set = @intCast(k) });
+                return;
+            }
+        }
+        try c.sets.append(c.gpa, s);
+        _ = try c.emit(.{ .set = @intCast(c.sets.items.len - 1) });
     }
 
     /// Alternatives in priority order. `back_widths`, when set, gives each
@@ -151,7 +218,7 @@ const Compiler = struct {
             var widths = try c.gpa.alloc(u32, alts.len);
             defer c.gpa.free(widths);
             for (alts, 0..) |a, i| {
-                widths[i] = fixedWidth(a) orelse
+                widths[i] = fixedWidth(a, c.utf8) orelse
                     return c.unsupported("look-behind must have a fixed width");
             }
             try c.compileAlt(alts, widths);
@@ -215,27 +282,30 @@ const Compiler = struct {
 };
 
 /// Width in bytes if every match of `n` has the same length.
-fn fixedWidth(n: *const ast.Node) ?u32 {
+fn fixedWidth(n: *const ast.Node, utf8_mode: bool) ?u32 {
     return switch (n.*) {
         .empty, .assertion, .look => 0,
-        .byte, .any, .set => 1,
+        .byte, .set => 1,
+        // A scalar value is 1 to 4 bytes long.
+        .any => if (utf8_mode) null else 1,
+        .cp_set => null,
         .concat => |items| blk: {
             var total: u32 = 0;
-            for (items) |it| total +|= fixedWidth(it) orelse break :blk null;
+            for (items) |it| total +|= fixedWidth(it, utf8_mode) orelse break :blk null;
             break :blk total;
         },
         .alt => |alts| blk: {
-            const w = fixedWidth(alts[0]) orelse break :blk null;
-            for (alts[1..]) |a| if (fixedWidth(a) != w) break :blk null;
+            const w = fixedWidth(alts[0], utf8_mode) orelse break :blk null;
+            for (alts[1..]) |a| if (fixedWidth(a, utf8_mode) != w) break :blk null;
             break :blk w;
         },
         .repeat => |r| blk: {
             const max = r.max orelse break :blk null;
             if (max != r.min) break :blk null;
-            break :blk (fixedWidth(r.sub) orelse break :blk null) *| r.min;
+            break :blk (fixedWidth(r.sub, utf8_mode) orelse break :blk null) *| r.min;
         },
-        .group => |g| fixedWidth(g.sub),
-        .atomic => |sub| fixedWidth(sub),
+        .group => |g| fixedWidth(g.sub, utf8_mode),
+        .atomic => |sub| fixedWidth(sub, utf8_mode),
         .backref => null,
     };
 }
@@ -243,7 +313,7 @@ fn fixedWidth(n: *const ast.Node) ?u32 {
 fn canBeEmpty(n: *const ast.Node) bool {
     return switch (n.*) {
         .empty, .assertion, .look, .backref => true,
-        .byte, .any, .set => false,
+        .byte, .any, .set, .cp_set => false,
         .concat => |items| for (items) |it| {
             if (!canBeEmpty(it)) break false;
         } else true,
@@ -280,6 +350,14 @@ fn firstOf(n: *const ast.Node) First {
             return .{ .set = s };
         },
         .set => |s| return .{ .set = s },
+        .cp_set => |ranges| {
+            var s: ByteSet = .{};
+            for (ranges) |r| {
+                const lead = utf8.leadByteRange(r);
+                s.addRange(lead.lo, lead.hi);
+            }
+            return .{ .set = s };
+        },
         .backref => return .{ .set = all, .nullable = true },
         .concat => |items| {
             var r: First = .{ .nullable = true };
@@ -314,8 +392,8 @@ fn firstOf(n: *const ast.Node) First {
 
 /// Compile a parsed pattern. The returned Program owns gpa memory (and copies
 /// the group names out of the parser arena).
-pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limits, diag: *parse.Diagnostic) parse.Error!Program {
-    var c: Compiler = .{ .gpa = gpa, .limits = limits, .group_count = parsed.group_count, .diag = diag };
+pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limits, utf8_mode: bool, diag: *parse.Diagnostic) parse.Error!Program {
+    var c: Compiler = .{ .gpa = gpa, .limits = limits, .group_count = parsed.group_count, .utf8 = utf8_mode, .diag = diag };
     errdefer c.insts.deinit(gpa);
     errdefer c.sets.deinit(gpa);
 
@@ -346,5 +424,6 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
         .group_count = parsed.group_count,
         .reg_count = 2 * (parsed.group_count + 1) + c.loop_slots,
         .names = names,
+        .utf8 = utf8_mode,
     };
 }

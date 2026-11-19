@@ -396,3 +396,118 @@ test "non-participating group expands to nothing" {
         }
     }.f);
 }
+
+// ---- utf8 mode --------------------------------------------------------------
+
+const u8opts: regex.Options = .{ .utf8 = true };
+
+fn expectU8(pattern: []const u8, hay: []const u8, want: ?[2]usize) !void {
+    try expectSpanOpts(pattern, hay, want, u8opts);
+}
+
+test "utf8: dot and classes consume whole characters" {
+    try expectU8("^.$", "é", .{ 0, 2 });
+    try expectU8("^.$", "☺", .{ 0, 3 });
+    try expectU8("^.$", "😀", .{ 0, 4 });
+    try expectU8("^..$", "é", null);
+    try expectU8("^[^a]$", "é", .{ 0, 2 });
+    try expectU8("^[^a]+$", "bé☺", .{ 0, 6 });
+    try expectU8("é+", "aééé", .{ 1, 7 });
+    try expectU8("[é]", "caf\u{e9}", .{ 3, 5 });
+    try expectU8("[à-ü]+", "xéüy", .{ 1, 5 });
+    try expectU8("[^à-ü]", "éa", .{ 2, 3 });
+    try expectU8("^\\W$", "é", .{ 0, 2 }); // \w is ASCII-only for now
+    try expectU8("^\\D$", "☺", .{ 0, 3 });
+    // The same patterns keep their byte meaning without utf8.
+    try expectSpan("^.$", "é", null);
+}
+
+test "utf8: dot does not match newline unless dot-all" {
+    try expectU8(".", "\n", null);
+    try expectU8("(?s).", "\n", .{ 0, 1 });
+    try expectU8("^.$", "\u{10FFFF}", .{ 0, 4 });
+}
+
+test "utf8: \\x escapes are scalar values" {
+    try expectU8("\\x{263A}", "a☺", .{ 1, 4 });
+    try expectU8("\\xE9", "é", .{ 0, 2 });
+    try expectU8("[\\x{3040}-\\x{309F}]+", "xひらがなy", .{ 1, 13 });
+    try expectU8("\\x{10FFFF}", "\u{10FFFF}", .{ 0, 4 });
+    var diag: regex.Diagnostic = .{};
+    try std.testing.expectError(error.InvalidPattern, regex.Regex.compile(gpa, "\\x{D800}", u8opts, &diag));
+    try std.testing.expectError(error.InvalidPattern, regex.Regex.compile(gpa, "\\x{110000}", u8opts, &diag));
+    // Byte mode still refuses what it cannot represent.
+    try expectCompileError("\\x{263A}", .{}, error.Unsupported);
+}
+
+test "utf8: the pattern must be valid UTF-8" {
+    var diag: regex.Diagnostic = .{};
+    try std.testing.expectError(error.InvalidPattern, regex.Regex.compile(gpa, "a\xffb", u8opts, &diag));
+    try std.testing.expectEqual(@as(usize, 1), diag.pos);
+    try std.testing.expectError(error.InvalidPattern, regex.Regex.compile(gpa, "a\xc3", u8opts, &diag));
+    try std.testing.expectError(error.InvalidPattern, regex.Regex.compile(gpa, "\xed\xa0\x80", u8opts, &diag));
+}
+
+test "utf8: invalid haystack bytes never match and never crash" {
+    const bad = [_][]const u8{
+        "\xff",     "\x80",   "\xc3",         "\xc0\x80", "\xe0\x80\x80", "\xed\xa0\x80", "\xf4\x90\x80\x80",
+        "\xe2\x82", "a\x80b", "\xf0\x9f\x98",
+    };
+    for (bad) |h| {
+        try expectU8("^.$", h, null);
+        try expectU8("^[^a]$", h, null);
+        try expectU8("^\\W$", h, null);
+        // Searching and iterating terminate and stay in bounds.
+        var re = try regex.Regex.compile(gpa, ".*", u8opts, null);
+        defer re.deinit(gpa);
+        var s = try re.searcher(gpa);
+        defer s.deinit();
+        _ = try s.count(h);
+    }
+    // Valid text around invalid bytes still matches.
+    try expectU8("a.b", "a\x80b", null);
+    try expectU8("é", "\xffé\xff", .{ 1, 3 });
+}
+
+test "utf8: empty matches never fall inside a character" {
+    try withSearcher("x*", u8opts, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            try std.testing.expectEqual(@as(usize, 2), try s.count("é")); // 0 and 2
+            try std.testing.expectEqual(@as(usize, 3), try s.count("é☺")); // 0, 2, 5
+            const spans = try s.findAll(gpa, "é☺");
+            defer gpa.free(spans);
+            try std.testing.expectEqual(@as(usize, 2), spans[1].start);
+        }
+    }.f);
+}
+
+test "utf8: look-behind needs a fixed byte width" {
+    try expectU8("(?<=é)x", "éx", .{ 2, 3 });
+    try expectCompileError("(?<=.)x", u8opts, error.Unsupported);
+    try expectSpan("(?<=.)x", "ax", .{ 1, 2 }); // fine in byte mode
+}
+
+test "utf8: quantifier after \\Q..\\E and escaped characters binds to the character" {
+    try expectU8("\\Qé\\E+", "éé", .{ 0, 4 });
+    try expectU8("\\é", "é", .{ 0, 2 });
+    try expectU8("\\é+", "éé", .{ 0, 4 });
+}
+
+test "utf8: captures and replacement work on multibyte text" {
+    try withSearcher("(.)(.)", u8opts, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            const out = try s.replaceAll(gpa, "éa☺b", "$2$1");
+            defer gpa.free(out);
+            try std.testing.expectEqualStrings("aé" ++ "b☺", out);
+        }
+    }.f);
+}
+
+test "utf8: program size for . and [^a]" {
+    // ADR 0001 gate: lowering must stay small (measured sizes are in the ADR).
+    inline for (.{ ".", "(?s).", "[^a]", "\\W", "[à-ü]" }) |pat| {
+        var re = try regex.Regex.compile(gpa, pat, u8opts, null);
+        defer re.deinit(gpa);
+        try std.testing.expect(re.prog.insts.len < 80);
+    }
+}

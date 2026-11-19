@@ -5,6 +5,7 @@
 //! once compilation is done.
 
 const ByteSet = @import("byteset.zig").ByteSet;
+const CpRange = @import("utf8.zig").CpRange;
 
 pub const Assertion = enum {
     line_start, // ^ in line mode
@@ -25,6 +26,8 @@ pub const Node = union(enum) {
     /// `.`; the payload says whether it also matches '\n'.
     any: bool,
     set: ByteSet,
+    /// utf8 mode only: sorted, merged ranges of Unicode scalar values.
+    cp_set: []const CpRange,
     concat: []const *const Node,
     alt: []const *const Node,
     repeat: Repeat,

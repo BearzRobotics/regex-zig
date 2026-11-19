@@ -1,6 +1,6 @@
 # 0001: UTF-8 matching
 
-Status: **Accepted** (decisions in §8); nothing is implemented yet.
+Status: **Accepted** (decisions in §8). Phase 1 is implemented; §9 records what was measured.
 
 Related: SPEC.md §2 goal 4 ("match over bytes by default and over UTF-8 when requested") and §6 (`utf8` option).
 
@@ -99,3 +99,25 @@ Proposed phase 1: ASCII-only folding, documented as a known deviation, with an `
 3. **Dialects:** all three dialects in phase 1. The parser is shared, so restricting `.posix_ere` would add a special case rather than remove work. `utf8` is orthogonal to leftmost-first versus leftmost-longest.
 4. **Unicode data:** generated tables checked into the repo (phase 2), with the generator script and the Unicode version recorded. No dependency.
 5. **Lowering strategy:** the byte-sequence approach (§3.1) stays the plan. Because it has not been measured, the first step of phase 1 is a size check: lower `.` and `[^a]` and record the instruction counts. If they are unreasonable, revisit §3.2 before building further.
+
+## 9. Phase 1 results
+
+Implemented: `Options.utf8`, UTF-8 validation of the pattern, code-point literals, `.`, classes and negation, `\x{..}`, iteration that never splits a character, and the fixed-byte-width look-behind rule, for all three dialects. Code: `src/utf8.zig` (ranges and lowering), `parse.zig`, `program.zig`.
+
+**Size gate (§8.5), measured with the byte-sequence lowering and no suffix sharing:**
+
+| Pattern (utf8) | Instructions | Byte sets |
+|---|---|---|
+| `.` | 49 | 11 |
+| `(?s).` | 46 | 10 |
+| `[^a]` | 49 | 11 |
+| `\W` | 58 | 13 |
+| `[à-ü]` | 5 | 1 |
+
+These are small against `max_program_len` (100,000), so the gate passes and §3.2 stays rejected.
+
+**Known cost.** The VM tries the byte sequences one after another, pushing a branch frame for each. A non-ASCII character in `.` therefore costs up to eight failed alternatives before the right one. Grouping sequences by lead byte (or a dispatch instruction) is a likely optimisation, to be done only with a benchmark.
+
+**Testing.** `utf8.zig` checks the range splitting against `std.unicode` for every scalar value (about 1.1 million) on several range shapes, requires that no two sequences accept the same encoding, and checks ill-formed forms (overlong, surrogate, above U+10FFFF, truncated, stray continuation). `tests.zig` covers the parser, search and iteration behaviour, and invalid haystacks.
+
+**Behaviour choices to be aware of.** In `utf8` mode `\xHH` is the scalar U+00HH (so `\xE9` is `é`, two bytes). A stray continuation byte is never a match start. `\W`, `\D`, `\S` and negated POSIX classes include all non-ASCII characters until phase 2.

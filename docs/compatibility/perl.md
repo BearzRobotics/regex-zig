@@ -32,7 +32,13 @@ conditionals, recursion, callouts.
 
 ## Known gaps and deviations
 
-- Byte matching only: no UTF-8, no Unicode case folding; `.` consumes one byte.
+- Byte matching by default: `.` consumes one byte. With `Options.utf8` the pattern
+  must be valid UTF-8 and `.`, classes, negation and `\x{...}` work on Unicode
+  scalar values. Still byte/ASCII-only in `utf8` mode: `\w \d \s \b` and the
+  POSIX classes (so `\W` matches any non-ASCII character), case folding, and
+  `\p{..}`. Look-behind must have a fixed width in bytes (`(?<=.)` is rejected).
+  A match never starts inside a character; invalid UTF-8 in the haystack never
+  matches `.` or a class.
 - Case-insensitive matching is ASCII only.
 - Nested quantifiers such as `(a+)+b` are exponential in a backtracker; the
   step budget turns this into `StepLimitExceeded`.

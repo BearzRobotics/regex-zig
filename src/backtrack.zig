@@ -92,6 +92,9 @@ pub const Searcher = struct {
         var start = from;
         const first = s.prog.first_bytes;
         while (start <= hay.len) : (start += 1) {
+            // In utf8 mode a match never starts inside a character. A stray
+            // continuation byte is skipped too: nothing can match it anyway.
+            if (s.prog.utf8 and start < hay.len and hay[start] & 0xC0 == 0x80) continue;
             if (first) |set| {
                 // A pattern that cannot match empty needs a byte here.
                 if (start == hay.len) break;
