@@ -15,6 +15,8 @@ pub const Assertion = enum {
     text_end_or_final_newline, // \Z, or $ outside line mode
     word_boundary,
     not_word_boundary,
+    word_start, // \<
+    word_end, // \>
     search_start, // \G: position where this search began
 };
 

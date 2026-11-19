@@ -332,7 +332,6 @@ test "posix_ere dialect" {
     try expectSpanOpts("(a)\\1", "xaa", .{ 1, 3 }, ere);
     // A backslash in a bracket expression is a literal.
     try expectSpanOpts("[\\d]+", "5\\d", .{ 1, 3 }, ere);
-    try std.testing.expectError(error.Unsupported, regex.Regex.compile(gpa, "\\<a", ere, null));
     // Case folding applies as in the other dialects.
     try expectSpanOpts("COPY", "a copy", .{ 2, 6 }, .{ .dialect = .posix_ere, .ignore_case = true });
 }
@@ -863,7 +862,10 @@ const Oom = error{OutOfMemory};
 const Gen = struct {
     r: std.Random,
     out: std.ArrayList(u8) = .empty,
+    /// POSIX syntax (no `(?:`, no lazy quantifiers).
     ere: bool,
+    /// Basic-expression spelling: `\\(`, `\\|`, `\\+`, `\\{m,n\\}`.
+    bre: bool = false,
     /// A quantifier was applied to something containing a group: capture
     /// positions may legitimately differ between the engines then.
     quantified_group: bool = false,
@@ -875,7 +877,7 @@ const Gen = struct {
     fn alt(g: *Gen, depth: u32) Oom!void {
         try g.concat(depth);
         if (g.r.uintLessThan(u8, 4) == 0) {
-            try g.put("|");
+            try g.put(if (g.bre) "\\|" else "|");
             try g.concat(depth);
         }
     }
@@ -889,7 +891,8 @@ const Gen = struct {
         const has_group = try g.atom(depth);
         if (g.r.uintLessThan(u8, 3) != 0) return;
         const quants = [_][]const u8{ "*", "+", "?", "{1,2}", "{2}", "{0,2}" };
-        try g.put(quants[g.r.uintLessThan(usize, quants.len)]);
+        const bre_quants = [_][]const u8{ "*", "\\+", "\\?", "\\{1,2\\}", "\\{2\\}", "\\{0,2\\}" };
+        try g.put(if (g.bre) bre_quants[g.r.uintLessThan(usize, bre_quants.len)] else quants[g.r.uintLessThan(usize, quants.len)]);
         if (!g.ere and g.r.uintLessThan(u8, 3) == 0) try g.put("?");
         if (has_group) g.quantified_group = true;
     }
@@ -901,9 +904,9 @@ const Gen = struct {
             4 => try g.put("."),
             5 => try g.put(if (g.r.boolean()) "[ab]" else "[^a]"),
             6, 7 => if (depth > 0) {
-                try g.put("(");
+                try g.put(if (g.bre) "\\(" else "(");
                 try g.alt(depth - 1);
-                try g.put(")");
+                try g.put(if (g.bre) "\\)" else ")");
                 return true;
             } else try g.put("a"),
             8 => if (depth > 0 and !g.ere) {
@@ -980,9 +983,9 @@ test "differential: the Pike VM agrees with the backtracker on random patterns" 
     const r = prng.random();
     const alphabet = "abc\n";
     var compared: usize = 0;
-    for ([_]regex.Dialect{ .perl, .posix_ere }) |dialect| {
+    for ([_]regex.Dialect{ .perl, .posix_ere, .posix_bre }) |dialect| {
         for (0..1500) |_| {
-            var g: Gen = .{ .r = r, .ere = dialect == .posix_ere };
+            var g: Gen = .{ .r = r, .ere = dialect == .posix_ere or dialect == .posix_bre, .bre = dialect == .posix_bre };
             defer g.out.deinit(gpa);
             try g.alt(2);
             const opts: regex.Options = .{ .dialect = dialect };
@@ -1015,9 +1018,9 @@ test "differential: the lazy DFA agrees with the Pike VM on random patterns" {
     const r = prng.random();
     const alphabet = "abc\n";
     var compared: usize = 0;
-    for ([_]regex.Dialect{ .perl, .posix_ere, .oniguruma }) |dialect| {
+    for ([_]regex.Dialect{ .perl, .posix_ere, .oniguruma, .posix_bre }) |dialect| {
         for (0..1500) |_| {
-            var g: Gen = .{ .r = r, .ere = dialect == .posix_ere };
+            var g: Gen = .{ .r = r, .ere = dialect == .posix_ere or dialect == .posix_bre, .bre = dialect == .posix_bre };
             defer g.out.deinit(gpa);
             try g.alt(2);
             // Skip what the parser rejects or what the DFA cannot take.
@@ -1083,4 +1086,189 @@ test "word boundaries in the DFA (ASCII)" {
             try expectSameEngines(pat, .{}, .dfa, .pike, true, h);
         }
     }
+}
+
+// ---- POSIX BRE and the GNU word anchors ------------------------------------------
+
+const bre_opts: regex.Options = .{ .dialect = .posix_bre };
+
+test "bre: groups, alternation and intervals use backslashes" {
+    try expectSpanOpts("a\\(b\\|c\\)*d", "xabcbd", .{ 1, 6 }, bre_opts);
+    try expectSpanOpts("a\\{2,3\\}", "aaaa", .{ 0, 3 }, bre_opts);
+    try expectSpanOpts("a\\{2\\}", "aaaa", .{ 0, 2 }, bre_opts);
+    try expectSpanOpts("a\\{2,\\}", "aaaa", .{ 0, 4 }, bre_opts);
+    try expectSpanOpts("ab\\+", "abbb", .{ 0, 4 }, bre_opts);
+    try expectSpanOpts("ab\\?c", "ac abc", .{ 0, 2 }, bre_opts);
+    try expectSpanOpts("a\\|ab", "abc", .{ 0, 2 }, bre_opts); // leftmost-longest
+    try expectSpanOpts("x*", "xxx", .{ 0, 3 }, bre_opts);
+    try expectSpanOpts("a**", "aaa", .{ 0, 3 }, bre_opts); // a quantifier may follow a quantifier
+}
+
+test "bre: ERE operators are ordinary characters" {
+    try expectSpanOpts("(a)", "x(a)", .{ 1, 4 }, bre_opts);
+    try expectSpanOpts("a|b", "xa|b", .{ 1, 4 }, bre_opts);
+    try expectSpanOpts("a+", "aa+", .{ 1, 3 }, bre_opts);
+    try expectSpanOpts("a?", "a?", .{ 0, 2 }, bre_opts);
+    try expectSpanOpts("a{2}", "a{2}", .{ 0, 4 }, bre_opts);
+    try expectSpanOpts("a{2}", "aa", null, bre_opts);
+}
+
+test "bre: star and anchors are special only where POSIX says" {
+    try expectSpanOpts("*a", "*a", .{ 0, 2 }, bre_opts); // star at the start is literal
+    try expectSpanOpts("\\(*a\\)", "x*a", .{ 1, 3 }, bre_opts); // and at the start of a group
+    try expectSpanOpts("a\\|*b", "*b", .{ 0, 2 }, bre_opts); // and after an alternation bar
+    try expectSpanOpts("^*a", "*a", .{ 0, 2 }, bre_opts); // star after ^ is literal
+    try expectSpanOpts("a^b", "a^b", .{ 0, 3 }, bre_opts); // ^ in the middle is literal
+    try expectSpanOpts("a$b", "a$b", .{ 0, 3 }, bre_opts); // and so is $
+    try expectSpanOpts("^a", "ba", null, bre_opts);
+    try expectSpanOpts("a$", "ab", null, bre_opts);
+    try expectSpanOpts("a$", "ba", .{ 1, 2 }, bre_opts);
+    try expectSpanOpts("\\(^a\\)", "ba", null, bre_opts); // ^ at the start of a group anchors
+    try expectSpanOpts("\\(^a\\)", "ab", .{ 0, 1 }, bre_opts);
+    try expectSpanOpts("x\\|^a", "ba", null, bre_opts);
+    try expectSpanOpts("\\(a$\\)", "ba", .{ 1, 2 }, bre_opts); // $ at the end of a group anchors
+}
+
+test "bre: back-references and GNU escapes" {
+    try expectSpanOpts("\\(a*\\)b\\1", "aabaa", .{ 0, 5 }, bre_opts);
+    try expectSpanOpts("\\(.\\)\\1", "abccd", .{ 2, 4 }, bre_opts);
+    try expectSpanOpts("\\w\\+", "  foo_1 ", .{ 2, 7 }, bre_opts);
+    try expectSpanOpts("a\\sb", "a b", .{ 0, 3 }, bre_opts);
+    try expectSpanOpts("\\bfoo\\b", "a foo b", .{ 2, 5 }, bre_opts);
+    try expectSpanOpts("a\\.b", "axb a.b", .{ 4, 7 }, bre_opts);
+    try expectSpanOpts("a\\*", "a*", .{ 0, 2 }, bre_opts);
+    try expectSpanOpts("[a-c]*", "abcd", .{ 0, 3 }, bre_opts);
+    try expectSpanOpts("[\\n]", "\\", .{ 0, 1 }, bre_opts); // a backslash in a bracket is literal
+    try expectSpanOpts("a.c", "a\nc", .{ 0, 3 }, bre_opts); // `.` matches a newline
+}
+
+test "bre: syntax errors" {
+    try expectCompileError("\\(a", bre_opts, error.InvalidPattern);
+    try expectCompileError("a\\)", bre_opts, error.InvalidPattern);
+    try expectCompileError("a\\{2", bre_opts, error.InvalidPattern);
+    try expectCompileError("a\\{3,2\\}", bre_opts, error.InvalidPattern);
+    try expectCompileError("\\{1\\}", bre_opts, error.InvalidPattern);
+    try expectCompileError("a\\{\\}", bre_opts, error.InvalidPattern);
+    try expectCompileError("a\\{2000\\}", bre_opts, error.LimitExceeded);
+}
+
+test "word and text anchors in the POSIX dialects" {
+    const ere: regex.Options = .{ .dialect = .posix_ere };
+    for ([_]regex.Options{ ere, bre_opts }) |o| {
+        try expectSpanOpts("\\<foo\\>", "a foo b", .{ 2, 5 }, o);
+        try expectSpanOpts("\\<foo\\>", "xfoo foox", null, o);
+        try expectSpanOpts("\\<f", "of f", .{ 3, 4 }, o);
+        try expectSpanOpts("o\\>", "of o", .{ 3, 4 }, o);
+        try expectSpanOpts("\\`a", "ba", null, o);
+        try expectSpanOpts("\\`a", "ab", .{ 0, 1 }, o);
+        try expectSpanOpts("a\\'", "ab", null, o);
+        try expectSpanOpts("a\\'", "ba", .{ 1, 2 }, o);
+    }
+    // POSIX `$` is the end of the text, not "before a final newline".
+    try expectSpanOpts("a$", "a\n", null, ere);
+    try expectSpanOpts("a$", "a\n", null, bre_opts);
+    try expectSpanOpts("a$", "a\n", .{ 0, 1 }, .{}); // Perl's does match there
+}
+
+test "bre: leftmost-longest on every engine" {
+    for ([_]regex.Engine{ .auto, .dfa, .pike, .backtrack }) |eng| {
+        var o = bre_opts;
+        o.engine = eng;
+        try expectSpanOpts("a\\|ab\\|abc", "abcd", .{ 0, 3 }, o);
+        try expectSpanOpts("\\(a\\|ab\\)\\(c\\|bcd\\)", "abcd", .{ 0, 4 }, o);
+    }
+}
+
+// ---- the Rust dialect -------------------------------------------------------------
+
+const rust: regex.Options = .{ .dialect = .rust };
+const rust8: regex.Options = .{ .dialect = .rust, .utf8 = true };
+
+test "rust: groups, flags and quantifiers" {
+    try expectSpanOpts("a(b|c)*d", "xabcbd", .{ 1, 6 }, rust);
+    try expectSpanOpts("(?P<x>a)(?<y>b)", "ab", .{ 0, 2 }, rust);
+    try expectSpanOpts("a+?", "aaa", .{ 0, 1 }, rust);
+    try expectSpanOpts("a{2,3}", "aaaa", .{ 0, 3 }, rust);
+    try expectSpanOpts("(?i)abc", "xABC", .{ 1, 4 }, rust);
+    try expectSpanOpts("(?i:a)b", "Ab", .{ 0, 2 }, rust);
+    try expectSpanOpts("(?i:a)b", "AB", null, rust);
+    try expectSpanOpts("(?s)a.b", "a\nb", .{ 0, 3 }, rust);
+    try expectSpanOpts("a.b", "a\nb", null, rust);
+    try expectSpanOpts("(?m)^b$", "a\nb\nc", .{ 2, 3 }, rust);
+    try expectSpanOpts("(?x) a b # comment", "ab", .{ 0, 2 }, rust);
+    try expectSpanOpts("a|", "b", .{ 0, 0 }, rust); // empty alternative
+    try expectSpanOpts("a|b|", "c", .{ 0, 0 }, rust);
+}
+
+test "rust: swap-greed flag" {
+    try expectSpanOpts("(?U)a+", "aaa", .{ 0, 1 }, rust);
+    try expectSpanOpts("(?U)a+?", "aaa", .{ 0, 3 }, rust);
+    try expectSpanOpts("(?U:a*)b", "aab", .{ 0, 3 }, rust);
+    try expectSpanOpts("a+(?U)b+", "abbb", .{ 0, 2 }, rust);
+}
+
+test "rust: $ is the end of the text" {
+    try expectSpanOpts("a$", "a\n", null, rust);
+    try expectSpanOpts("a$", "a", .{ 0, 1 }, rust);
+    try expectSpanOpts("\\Aa\\z", "a", .{ 0, 1 }, rust);
+}
+
+test "rust: unsupported constructs are errors" {
+    try expectCompileError("(a)\\1", rust, error.Unsupported);
+    try expectCompileError("(?<n>a)\\k<n>", rust, error.Unsupported);
+    try expectCompileError("a(?=b)", rust, error.Unsupported);
+    try expectCompileError("a(?!b)", rust, error.Unsupported);
+    try expectCompileError("(?<=a)b", rust, error.Unsupported);
+    try expectCompileError("(?<!a)b", rust, error.Unsupported);
+    try expectCompileError("(?>a)", rust, error.Unsupported);
+    try expectCompileError("(?#c)a", rust, error.Unsupported);
+    try expectCompileError("a*+", rust, error.InvalidPattern); // no possessive; a nested quantifier
+    try expectCompileError("a**", rust, error.InvalidPattern);
+    try expectCompileError("a\\Z", rust, error.InvalidPattern);
+    try expectCompileError("\\Ga", rust, error.InvalidPattern);
+    try expectCompileError("\\Qa\\E", rust, error.InvalidPattern);
+    try expectCompileError("\\ha", rust, error.InvalidPattern);
+    try expectCompileError("(?-u)a", rust, error.Unsupported);
+    // The same constructs are fine in the Perl dialect.
+    try expectSpanOpts("(a)\\1", "aa", .{ 0, 2 }, .{});
+}
+
+test "rust: every pattern runs on a linear-time engine" {
+    for ([_][]const u8{ "a(b|c)*d", "(?i)x+y", "[a-z&&[^aeiou]]+", "\\bfoo\\b", "(a*)*b" }) |pat| {
+        var re = try regex.Regex.compile(gpa, pat, rust, null);
+        defer re.deinit(gpa);
+        try std.testing.expect(re.prog.engine != .backtrack);
+    }
+}
+
+test "rust: class set operations" {
+    try expectSpanOpts("[a-z&&[^aeiou]]+", "aebcdi", .{ 2, 5 }, rust);
+    try expectSpanOpts("[a-z--aeiou]+", "aebcdi", .{ 2, 5 }, rust);
+    try expectSpanOpts("[a-f~~d-k]+", "xdxbk", .{ 3, 5 }, rust); // symmetric difference is a-c and g-k; 'd' is in both
+    try expectSpanOpts("[a-f~~d-k]+", "bgh", .{ 0, 3 }, rust);
+    try expectSpanOpts("[\\w--\\d]+", "12ab3", .{ 2, 4 }, rust);
+    try expectSpanOpts("[[a-z]&&[c-m]&&[^e]]+", "bcefz", .{ 1, 2 }, rust);
+    try expectSpanOpts("[^a-z&&[^aeiou]]", "b", null, rust); // negation applies to the whole class
+    try expectSpanOpts("[^a-z&&[^aeiou]]", "e", .{ 0, 1 }, rust);
+    try expectSpanOpts("[a-c]", "-", null, rust);
+    try expectSpanOpts("[a-]", "-", .{ 0, 1 }, rust);
+    // Outside the Rust dialect `&&` is not accepted here.
+    try expectCompileError("[a&&b]", .{}, error.Unsupported);
+    // A range ending in '-' still works in the Perl dialect.
+    try expectSpanOpts("[+--]+", "+,-", .{ 0, 3 }, .{});
+}
+
+test "rust: \\u escapes and Unicode" {
+    try expectSpanOpts("\\x41", "A", .{ 0, 1 }, rust);
+    try expectSpanOpts("\\u0041", "A", .{ 0, 1 }, rust);
+    try expectSpanOpts("\\u{41}", "A", .{ 0, 1 }, rust);
+    try expectSpanOpts("\\U00000041", "A", .{ 0, 1 }, rust);
+    try expectSpanOpts("\\u00E9", "é", .{ 0, 2 }, rust8);
+    try expectSpanOpts("\\u{1F600}", "😀", .{ 0, 4 }, rust8);
+    try expectCompileError("\\u00", rust, error.InvalidPattern);
+    try expectCompileError("\\u{D800}", rust8, error.InvalidPattern);
+    if (!unicode.enabled) return;
+    try expectSpanOpts("\\pL+", "123héllo456", .{ 3, 9 }, rust8);
+    try expectSpanOpts("(?i)É", "é", .{ 0, 2 }, rust8);
+    try expectSpanOpts("[\\p{Greek}&&\\p{Ll}]+", "ΑΒαβγΓ", .{ 4, 10 }, rust8);
 }

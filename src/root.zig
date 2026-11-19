@@ -58,7 +58,7 @@ pub const Regex = struct {
         const parsed = try parse.parse(arena_state.allocator(), pattern, options.dialect, options.ignore_case, options.utf8, options.limits, d);
         const prog = try program.compile(gpa, parsed, options.limits, .{
             .utf8 = options.utf8,
-            .longest = options.dialect == .posix_ere,
+            .longest = options.dialect == .posix_ere or options.dialect == .posix_bre,
             .engine = options.engine,
         }, d);
         return .{ .prog = prog, .limits = options.limits };

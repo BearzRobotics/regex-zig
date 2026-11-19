@@ -18,6 +18,8 @@ pub fn check(a: ast.Assertion, hay: []const u8, pos: usize, search_start: usize,
         .text_end_or_final_newline => pos == hay.len or (pos + 1 == hay.len and hay[pos] == '\n'),
         .word_boundary => wordBefore(hay, pos, utf8_mode) != wordAfter(hay, pos, utf8_mode),
         .not_word_boundary => wordBefore(hay, pos, utf8_mode) == wordAfter(hay, pos, utf8_mode),
+        .word_start => !wordBefore(hay, pos, utf8_mode) and wordAfter(hay, pos, utf8_mode),
+        .word_end => wordBefore(hay, pos, utf8_mode) and !wordAfter(hay, pos, utf8_mode),
         .search_start => pos == search_start,
     };
 }

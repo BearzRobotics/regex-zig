@@ -462,6 +462,8 @@ fn reverseAssertion(a: ast.Assertion) ast.Assertion {
         .line_end => .line_start,
         .text_start => .text_end,
         .text_end, .text_end_or_final_newline => .text_start,
+        .word_start => .word_end,
+        .word_end => .word_start,
         .word_boundary, .not_word_boundary, .search_start => a,
     };
 }
@@ -473,7 +475,7 @@ fn dfaEligible(n: *const ast.Node, unicode_word: bool) bool {
     return switch (n.*) {
         .assertion => |a| switch (a) {
             .search_start => false,
-            .word_boundary, .not_word_boundary => !unicode_word,
+            .word_boundary, .not_word_boundary, .word_start, .word_end => !unicode_word,
             else => true,
         },
         .empty, .byte, .any, .set, .cp_set, .atomic, .look, .backref => true,

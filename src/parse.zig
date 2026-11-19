@@ -1,4 +1,4 @@
-//! Parser for the Perl-style syntax family. Three dialects share one parser:
+//! Parser for the Perl-style syntax family. Five dialects share one parser:
 //!
 //!   * .perl       — Perl/PCRE flavour: `^`/`$` match at text boundaries unless
 //!                   (?m); (?s) lets `.` match '\n'; `\h` is horizontal space.
@@ -13,6 +13,19 @@
 //!                   stands for the character itself. Matching is still
 //!                   leftmost-first, so the span of a match may differ from a
 //!                   leftmost-longest engine; whether a match exists does not.
+//!   * .rust       — the syntax of Rust's `regex` crate (as used by ripgrep):
+//!                   Perl-like groups, flags (i m s x U u) and escapes, `$` is
+//!                   the end of the text, and set operations in classes
+//!                   (`[a-z&&[^aeiou]]`, `--`, `~~`). No back-references,
+//!                   look-around, atomic groups, possessive quantifiers, `\Z`
+//!                   or `\G`: those are errors, so every pattern runs on the
+//!                   linear-time engines.
+//!   * .posix_bre  — POSIX basic expressions with the GNU extensions: `\( \)`
+//!                   groups, `\{m,n\}` intervals, `\+ \? \|`, `*` literal at the
+//!                   start of an expression or group, `^` and `$` anchors only
+//!                   where POSIX allows (otherwise literal), and the same GNU
+//!                   escapes as the ERE (`\w \s \b \< \> \` \'` and
+//!                   back-references).
 //!
 //! By default matching is byte-based: a pattern byte >= 0x80 is a literal byte,
 //! and `.` and negated classes consume one byte. With `utf8` set the pattern
@@ -30,7 +43,7 @@ const unicode = @import("unicode.zig");
 
 const Node = ast.Node;
 
-pub const Dialect = enum { perl, oniguruma, posix_ere };
+pub const Dialect = enum { perl, oniguruma, posix_ere, posix_bre, rust };
 
 pub const Limits = struct {
     max_pattern_len: usize = 64 * 1024,
@@ -77,6 +90,8 @@ const Flags = struct {
     line_anchors: bool = false,
     dot_all: bool = false,
     extended: bool = false,
+    /// (?U): `*` is lazy and `*?` greedy (Rust dialect).
+    swap_greed: bool = false,
 };
 
 const Parser = struct {
@@ -93,6 +108,32 @@ const Parser = struct {
     max_backref: u32 = 0,
     backref_pos: usize = 0,
     diag: *Diagnostic,
+
+    fn posix(p: *const Parser) bool {
+        return p.dialect == .posix_ere or p.dialect == .posix_bre;
+    }
+
+    /// The alternation operator: `|`, or `\|` in a basic expression.
+    fn atAltBar(p: *Parser) bool {
+        return if (p.dialect == .posix_bre) p.startsWith("\\|") else p.peek() == '|';
+    }
+
+    fn eatAltBar(p: *Parser) bool {
+        if (!p.atAltBar()) return false;
+        p.pos += if (p.dialect == .posix_bre) 2 else 1;
+        return true;
+    }
+
+    /// The end of a group: `)`, or `\)` in a basic expression.
+    fn atGroupClose(p: *Parser) bool {
+        return if (p.dialect == .posix_bre) p.startsWith("\\)") else p.peek() == ')';
+    }
+
+    fn eatGroupClose(p: *Parser) bool {
+        if (!p.atGroupClose()) return false;
+        p.pos += if (p.dialect == .posix_bre) 2 else 1;
+        return true;
+    }
 
     fn fail(p: *Parser, err: Error, pos: usize, msg: []const u8) Error {
         p.diag.* = .{ .pos = pos, .message = msg };
@@ -299,10 +340,10 @@ const Parser = struct {
         try p.enter();
         defer p.leave();
         const first = try p.parseConcat();
-        if (p.peek() != '|') return first;
+        if (!p.atAltBar()) return first;
         var alts: std.ArrayList(*const Node) = .empty;
         try alts.append(p.arena, first);
-        while (p.eat('|')) try alts.append(p.arena, try p.parseConcat());
+        while (p.eatAltBar()) try alts.append(p.arena, try p.parseConcat());
         return p.node(.{ .alt = alts.items });
     }
 
@@ -311,8 +352,9 @@ const Parser = struct {
         while (true) {
             p.skipExtended();
             const c = p.peek() orelse break;
-            if (c == '|' or c == ')') break;
-            if (p.startsWith("\\Q")) {
+            _ = c;
+            if (p.atAltBar() or p.atGroupClose()) break;
+            if (p.dialect != .posix_bre and p.dialect != .rust and p.startsWith("\\Q")) {
                 // \Q...\E: literal text. A following quantifier binds to the
                 // last character only, as in Perl.
                 p.pos += 2;
@@ -328,7 +370,13 @@ const Parser = struct {
                 }
                 continue;
             }
-            const atom = (try p.parseAtom()) orelse continue;
+            const atom = (try p.parseAtom(items.items.len == 0)) orelse continue;
+            // In a basic expression an anchor cannot be repeated: a `*` after
+            // `^` is a literal star.
+            if (p.dialect == .posix_bre and atom.* == .assertion) {
+                try items.append(p.arena, atom);
+                continue;
+            }
             try items.append(p.arena, try p.parseQuantifiers(atom));
         }
         return switch (items.items.len) {
@@ -355,6 +403,7 @@ const Parser = struct {
     /// Parses a quantifier at the cursor, or returns null leaving the cursor
     /// untouched (a `{` that is not a valid quantifier is a literal).
     fn tryQuantifier(p: *Parser) Error!?Quant {
+        if (p.dialect == .posix_bre) return p.tryBreQuantifier();
         const c = p.peek() orelse return null;
         switch (c) {
             '*' => {
@@ -397,6 +446,39 @@ const Parser = struct {
         }
     }
 
+    /// `*`, `\+`, `\?` and `\{m,n\}` in a basic expression.
+    fn tryBreQuantifier(p: *Parser) Error!?Quant {
+        if (p.eat('*')) return .{ .min = 0, .max = null, .braces = false };
+        if (p.startsWith("\\+")) {
+            p.pos += 2;
+            return .{ .min = 1, .max = null, .braces = false };
+        }
+        if (p.startsWith("\\?")) {
+            p.pos += 2;
+            return .{ .min = 0, .max = 1, .braces = false };
+        }
+        if (!p.startsWith("\\{")) return null;
+        const save = p.pos;
+        p.pos += 2;
+        const lo = p.number();
+        var hi: ?u32 = lo;
+        var has_comma = false;
+        if (p.eat(',')) {
+            has_comma = true;
+            hi = p.number();
+        }
+        if (!p.startsWith("\\}")) return p.fail(error.InvalidPattern, save, "unterminated or malformed \\{...\\}");
+        p.pos += 2;
+        if (lo == null and !(has_comma and hi != null))
+            return p.fail(error.InvalidPattern, save, "malformed \\{...\\}");
+        const min = lo orelse 0;
+        const max: ?u32 = if (has_comma) hi else min;
+        if (max) |m| if (m < min) return p.fail(error.InvalidPattern, save, "repeat range is reversed");
+        if (min > p.limits.max_repeat or (max orelse 0) > p.limits.max_repeat)
+            return p.fail(error.LimitExceeded, save, "repeat count too large");
+        return .{ .min = min, .max = max, .braces = true };
+    }
+
     fn number(p: *Parser) ?u32 {
         const start = p.pos;
         var v: u64 = 0;
@@ -414,18 +496,23 @@ const Parser = struct {
             p.skipExtended();
             const qpos = p.pos;
             const q = (try p.tryQuantifier()) orelse break;
-            if (count > 0 and p.dialect == .perl)
+            if (count > 0 and (p.dialect == .perl or p.dialect == .rust))
                 return p.fail(error.InvalidPattern, qpos, "nested quantifier");
             var greed: ast.Greed = .greedy;
-            if (p.dialect == .posix_ere) {
+            if (p.posix()) {
                 // No lazy or possessive forms: a following `?` or `+` is
                 // another quantifier, read on the next turn of the loop.
             } else if (p.eat('?')) {
                 greed = .lazy;
-            } else if (p.peek() == '+' and !(q.braces and p.dialect == .oniguruma)) {
+            } else if (p.peek() == '+' and !(q.braces and p.dialect == .oniguruma) and p.dialect != .rust) {
                 p.pos += 1;
                 greed = .possessive;
             }
+            if (p.flags.swap_greed) greed = switch (greed) {
+                .greedy => .lazy,
+                .lazy => .greedy,
+                .possessive => .possessive,
+            };
             try p.enter();
             cur = try p.node(.{ .repeat = .{ .sub = cur, .min = q.min, .max = q.max, .greed = greed } });
             count += 1;
@@ -435,8 +522,32 @@ const Parser = struct {
     }
 
     /// Returns null for constructs that produce no node (comments, flag changes).
-    fn parseAtom(p: *Parser) Error!?*const Node {
+    fn parseAtom(p: *Parser, at_start: bool) Error!?*const Node {
         const c = p.src[p.pos];
+        if (p.dialect == .posix_bre) switch (c) {
+            // A star with nothing to repeat is an ordinary character.
+            '*' => {
+                p.pos += 1;
+                return try p.literal('*');
+            },
+            // An anchor only at the start of an expression or group, and `$`
+            // only at the end of one; elsewhere they are ordinary.
+            '^' => {
+                p.pos += 1;
+                return if (at_start) try p.node(.{ .assertion = .text_start }) else try p.literal('^');
+            },
+            '$' => {
+                p.pos += 1;
+                if (p.pos == p.src.len or p.startsWith("\\)") or p.startsWith("\\|"))
+                    return try p.node(.{ .assertion = .text_end });
+                return try p.literal('$');
+            },
+            '(', ')', '|', '+', '?', '{', '}' => {
+                p.pos += 1;
+                return try p.literal(c);
+            },
+            else => {},
+        };
         switch (c) {
             '(' => return p.parseGroup(),
             '[' => {
@@ -454,7 +565,8 @@ const Parser = struct {
             },
             '$' => {
                 p.pos += 1;
-                return try p.node(.{ .assertion = if (p.flags.line_anchors) .line_end else .text_end_or_final_newline });
+                // POSIX `$` is the end of the text; Perl's also matches before a final newline.
+                return try p.node(.{ .assertion = if (p.flags.line_anchors) .line_end else if (p.posix() or p.dialect == .rust) .text_end else .text_end_or_final_newline });
             },
             '\\' => return p.parseEscape(),
             '*', '+', '?' => return p.fail(error.InvalidPattern, p.pos, "quantifier has nothing to repeat"),
@@ -496,6 +608,12 @@ const Parser = struct {
             return p.finishGroup(open, .{ .capture = p.group_count }, saved);
         }
         const c = p.peek() orelse return p.fail(error.InvalidPattern, open, "unterminated group");
+        if (p.dialect == .rust) switch (c) {
+            '>', '=', '!', '#', '\'' => return p.fail(error.Unsupported, open, "group construct not supported by the Rust dialect (look-around, atomic group, comment)"),
+            '<' => if (p.startsWith("<=") or p.startsWith("<!"))
+                return p.fail(error.Unsupported, open, "look-behind is not supported by the Rust dialect"),
+            else => {},
+        };
         switch (c) {
             ':' => {
                 p.pos += 1;
@@ -571,13 +689,21 @@ const Parser = struct {
                 '-' => on = false,
                 'i' => f.ignore_case = on,
                 'x' => f.extended = on,
+                'U' => if (p.dialect == .rust) {
+                    f.swap_greed = on;
+                } else return p.fail(error.Unsupported, p.pos - 1, "unsupported inline flag"),
+                'u' => if (p.dialect != .rust) {
+                    return p.fail(error.Unsupported, p.pos - 1, "unsupported inline flag");
+                } else if (!on) {
+                    return p.fail(error.Unsupported, p.pos - 1, "(?-u): Unicode mode is chosen with Options.utf8, not per group");
+                },
                 // m and s swap meaning between the dialects.
                 'm' => switch (p.dialect) {
-                    .perl, .posix_ere => f.line_anchors = on,
+                    .perl, .posix_ere, .posix_bre, .rust => f.line_anchors = on,
                     .oniguruma => f.dot_all = on,
                 },
                 's' => switch (p.dialect) {
-                    .perl, .posix_ere => f.dot_all = on,
+                    .perl, .posix_ere, .posix_bre, .rust => f.dot_all = on,
                     .oniguruma => return p.fail(error.InvalidPattern, p.pos - 1, "unknown flag 's' in Oniguruma syntax"),
                 },
                 ')' => {
@@ -603,7 +729,7 @@ const Parser = struct {
     fn finishGroup(p: *Parser, open: usize, kind: GroupKind, saved: Flags) Error!*const Node {
         const sub = try p.parseAlt();
         p.flags = saved;
-        if (!p.eat(')')) return p.fail(error.InvalidPattern, open, "unterminated group");
+        if (!p.eatGroupClose()) return p.fail(error.InvalidPattern, open, "unterminated group");
         return switch (kind) {
             .plain => p.node(.{ .group = .{ .sub = sub, .index = null } }),
             .capture => |i| p.node(.{ .group = .{ .sub = sub, .index = i } }),
@@ -649,7 +775,8 @@ const Parser = struct {
                     s.addRange('a', 'f');
                     s.addRange('A', 'F');
                 },
-                .perl, .posix_ere => {
+                .rust => return null, // no \h in the Rust syntax
+                .perl, .posix_ere, .posix_bre => {
                     s.add(' ');
                     s.add('\t');
                 },
@@ -661,6 +788,18 @@ const Parser = struct {
 
     /// A single-character escape (after the backslash): \n \t \xHH \x{H..} \0oo and
     /// escaped punctuation. A byte in byte mode, a scalar value in utf8 mode. The cursor is just past the escape letter.
+    fn scalarFromHex(p: *Parser, digits: []const u8, at: usize) Error!u21 {
+        const v = std.fmt.parseInt(u32, digits, 16) catch
+            return p.fail(error.InvalidPattern, at, "invalid hexadecimal escape");
+        if (p.utf8) {
+            if (v > ucp.max_scalar) return p.fail(error.InvalidPattern, at, "code point above U+10FFFF");
+            if (v >= 0xD800 and v <= 0xDFFF) return p.fail(error.InvalidPattern, at, "surrogate code point");
+        } else if (v > 0xff) {
+            return p.fail(error.Unsupported, at, "code point above 0xFF (enable utf8 for Unicode matching)");
+        }
+        return @intCast(v);
+    }
+
     fn byteEscape(p: *Parser, c: u8, at: usize) Error!?u21 {
         switch (c) {
             'n' => return '\n',
@@ -693,15 +832,25 @@ const Parser = struct {
                     while (p.pos - s < 2 and p.pos < p.src.len and std.ascii.isHex(p.src[p.pos])) p.pos += 1;
                     digits = p.src[s..p.pos];
                 }
-                const v = std.fmt.parseInt(u32, digits, 16) catch
-                    return p.fail(error.InvalidPattern, at, "invalid hexadecimal escape");
-                if (p.utf8) {
-                    if (v > ucp.max_scalar) return p.fail(error.InvalidPattern, at, "code point above U+10FFFF");
-                    if (v >= 0xD800 and v <= 0xDFFF) return p.fail(error.InvalidPattern, at, "surrogate code point");
-                } else if (v > 0xff) {
-                    return p.fail(error.Unsupported, at, "code point above 0xFF (enable utf8 for Unicode matching)");
+                return try p.scalarFromHex(digits, at);
+            },
+            // \u7F7F, \u{7F7F} and \U0000007F: Rust only.
+            'u', 'U' => {
+                if (p.dialect != .rust) return null;
+                var digits: []const u8 = undefined;
+                if (p.eat('{')) {
+                    const s = p.pos;
+                    while (p.peek()) |d| : (p.pos += 1) if (d == '}') break;
+                    digits = p.src[s..p.pos];
+                    if (!p.eat('}')) return p.fail(error.InvalidPattern, at, "unterminated \\u{...}");
+                } else {
+                    const want: usize = if (c == 'u') 4 else 8;
+                    const s = p.pos;
+                    while (p.pos - s < want and p.pos < p.src.len and std.ascii.isHex(p.src[p.pos])) p.pos += 1;
+                    if (p.pos - s != want) return p.fail(error.InvalidPattern, at, "\\u needs exactly 4 hex digits, \\U exactly 8");
+                    digits = p.src[s..p.pos];
                 }
-                return @intCast(v);
+                return try p.scalarFromHex(digits, at);
             },
             else => {
                 if (std.ascii.isAlphanumeric(c)) return null;
@@ -716,6 +865,11 @@ const Parser = struct {
         const c = p.peek() orelse return p.fail(error.InvalidPattern, at, "pattern ends with a backslash");
         p.pos += 1;
 
+        if (p.dialect == .rust) switch (c) {
+            '1'...'9', 'k' => return p.fail(error.Unsupported, at, "back-references are not supported by the Rust dialect"),
+            'Z', 'G', 'R', 'X', 'K', 'C', 'Q', 'E' => return p.fail(error.InvalidPattern, at, "unrecognized escape sequence in the Rust dialect"),
+            else => {},
+        };
         // An escaped non-ASCII character stands for itself in every dialect.
         if (p.utf8 and c >= 0x80) {
             p.pos -= 1;
@@ -723,7 +877,7 @@ const Parser = struct {
             p.pos += d.len;
             return try p.literalCp(d.cp);
         }
-        if (p.dialect == .posix_ere) return p.posixEscape(c, at);
+        if (p.posix()) return p.posixEscape(c, at);
         if (try p.classEscape(c)) |found| {
             var cls = found;
             return try p.classNode(&cls);
@@ -783,7 +937,17 @@ const Parser = struct {
             },
             'b' => return try p.node(.{ .assertion = .word_boundary }),
             'B' => return try p.node(.{ .assertion = .not_word_boundary }),
-            '<', '>' => return p.fail(error.Unsupported, at, "word-start and word-end anchors \\< and \\>"),
+            '<' => return try p.node(.{ .assertion = .word_start }),
+            '>' => return try p.node(.{ .assertion = .word_end }),
+            '`' => return try p.node(.{ .assertion = .text_start }),
+            '\'' => return try p.node(.{ .assertion = .text_end }),
+            '(' => if (p.dialect == .posix_bre) {
+                p.group_count += 1;
+                return p.finishGroup(at, .{ .capture = p.group_count }, p.flags);
+            } else return try p.literal(c),
+            '{' => if (p.dialect == .posix_bre) {
+                return p.fail(error.InvalidPattern, at, "interval has nothing to repeat");
+            } else return try p.literal(c),
             '1'...'9' => {
                 const n: u32 = c - '0';
                 if (n > p.max_backref) {
@@ -798,20 +962,93 @@ const Parser = struct {
 
     // ---- character classes ----------------------------------------------
 
+    const SetOp = enum { intersection, difference, symmetric };
+
+    /// A set operator in a Rust-dialect class: `&&`, `--` or `~~`.
+    fn setOpAhead(p: *Parser) ?SetOp {
+        if (p.dialect != .rust) return null;
+        if (p.startsWith("&&")) return .intersection;
+        if (p.startsWith("--")) return .difference;
+        if (p.startsWith("~~")) return .symmetric;
+        return null;
+    }
+
+    fn classCopy(p: *Parser, c: Class) Error!Class {
+        var out: Class = .{ .bytes = c.bytes };
+        try out.ranges.appendSlice(p.arena, c.ranges.items);
+        return out;
+    }
+
+    fn classIntersect(p: *Parser, a: *Class, b: *Class) Error!Class {
+        try ucp.normalize(p.arena, &a.ranges);
+        try ucp.normalize(p.arena, &b.ranges);
+        var out: Class = .{ .bytes = a.bytes };
+        out.bytes.intersectWith(b.bytes);
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < a.ranges.items.len and j < b.ranges.items.len) {
+            const x = a.ranges.items[i];
+            const y = b.ranges.items[j];
+            const lo = @max(x.lo, y.lo);
+            const hi = @min(x.hi, y.hi);
+            if (lo <= hi) try out.ranges.append(p.arena, .{ .lo = lo, .hi = hi });
+            if (x.hi < y.hi) i += 1 else j += 1;
+        }
+        return out;
+    }
+
+    fn classSetOp(p: *Parser, op: SetOp, a: *Class, b: *Class) Error!Class {
+        switch (op) {
+            .intersection => return p.classIntersect(a, b),
+            .difference => {
+                var nb = try p.classCopy(b.*);
+                try p.classInvert(&nb);
+                return p.classIntersect(a, &nb);
+            },
+            .symmetric => {
+                var na = try p.classCopy(a.*);
+                var nb = try p.classCopy(b.*);
+                try p.classInvert(&na);
+                try p.classInvert(&nb);
+                var left = try p.classIntersect(a, &nb);
+                var right = try p.classIntersect(b, &na);
+                try p.classUnion(&left, right);
+                _ = &right;
+                return left;
+            },
+        }
+    }
+
     /// Cursor is just past '['. Consumes through the closing ']'.
     fn parseClass(p: *Parser) Error!Class {
         const open = p.pos - 1;
         try p.enter();
         defer p.leave();
-        var cls: Class = .{};
         const negate = p.eat('^');
-        var first = true;
+        var cls = try p.parseClassSeq(open, true);
+        // Rust: `[a-z&&[^aeiou]]`; all the operators have the same precedence
+        // and associate to the left.
+        while (p.setOpAhead()) |op| {
+            p.pos += 2;
+            var rhs = try p.parseClassSeq(open, false);
+            cls = try p.classSetOp(op, &cls, &rhs);
+        }
+        if (!p.eat(']')) return p.fail(error.InvalidPattern, open, "unterminated character class");
+        if (p.flags.ignore_case) try p.classFoldCase(&cls);
+        if (negate) try p.classInvert(&cls);
+        return cls;
+    }
+
+    /// The members of a class up to, not including, the closing ']' or (in
+    /// the Rust dialect) a set operator. `first` allows a leading ']' to be
+    /// an ordinary character.
+    fn parseClassSeq(p: *Parser, open: usize, first_may_be_bracket: bool) Error!Class {
+        var cls: Class = .{};
+        var first = first_may_be_bracket;
         while (true) {
             const c = p.peek() orelse return p.fail(error.InvalidPattern, open, "unterminated character class");
-            if (c == ']' and !first) {
-                p.pos += 1;
-                break;
-            }
+            if (c == ']' and !first) break;
+            if (p.setOpAhead() != null) break;
             first = false;
             if (c == '[') {
                 if (p.startsWith("[:")) {
@@ -829,7 +1066,7 @@ const Parser = struct {
 
             const lo = (try p.classItem(&cls)) orelse continue;
             // Range? The '-' is one byte, so test the byte after it.
-            if (p.peek() == '-' and p.pos + 1 < p.src.len and p.src[p.pos + 1] != ']') {
+            if (p.peek() == '-' and p.pos + 1 < p.src.len and p.src[p.pos + 1] != ']' and !(p.dialect == .rust and p.startsWith("--"))) {
                 const save = p.pos;
                 p.pos += 1;
                 const nxt = p.peek().?;
@@ -850,8 +1087,6 @@ const Parser = struct {
                 try p.classAddRange(&cls, lo, hi);
             } else try p.classAddCp(&cls, lo);
         }
-        if (p.flags.ignore_case) try p.classFoldCase(&cls);
-        if (negate) try p.classInvert(&cls);
         return cls;
     }
 
@@ -867,7 +1102,7 @@ const Parser = struct {
         }
         p.pos += 1;
         // In a POSIX bracket expression a backslash is an ordinary character.
-        if (c != '\\' or p.dialect == .posix_ere) return c;
+        if (c != '\\' or p.posix()) return c;
         const at = p.pos - 1;
         const e = p.peek() orelse return p.fail(error.InvalidPattern, at, "pattern ends with a backslash");
         if (p.utf8 and e >= 0x80) {
@@ -1015,7 +1250,7 @@ pub fn parse(
         .dialect = dialect,
         .utf8 = utf8,
         .limits = limits,
-        .flags = .{ .ignore_case = ignore_case, .line_anchors = dialect == .oniguruma, .dot_all = dialect == .posix_ere },
+        .flags = .{ .ignore_case = ignore_case, .line_anchors = dialect == .oniguruma, .dot_all = dialect == .posix_ere or dialect == .posix_bre },
         .diag = diag,
     };
     const root = try p.parseAlt();

@@ -170,7 +170,7 @@ pub const Dfa = struct {
                 },
                 .line_end => newline = true,
                 .text_start => d.uses_prev = true,
-                .word_boundary, .not_word_boundary => {
+                .word_boundary, .not_word_boundary, .word_start, .word_end => {
                     word = true;
                     d.uses_prev = true;
                 },
@@ -296,6 +296,8 @@ pub const Dfa = struct {
             .text_end, .text_end_or_final_newline => next == null,
             .word_boundary => (prev == .word) != (next != null and ByteSet.isWordByte(next.?)),
             .not_word_boundary => (prev == .word) == (next != null and ByteSet.isWordByte(next.?)),
+            .word_start => prev != .word and (next != null and ByteSet.isWordByte(next.?)),
+            .word_end => prev == .word and !(next != null and ByteSet.isWordByte(next.?)),
             .search_start => unreachable,
         };
     }
