@@ -1384,3 +1384,178 @@ test "literal prefix with a prefix at the end of the haystack and overlapping st
         }
     }
 }
+
+// ---- GNU grep reference cases ---------------------------------------------------------
+
+// src/testdata/grep_cases.txt is produced by tools/gen_grep_cases.py: random
+// BRE and ERE patterns, and which lines GNU grep selects (LC_ALL=C).
+const grep_cases = @embedFile("testdata/grep_cases.txt");
+
+// Patterns where GNU grep 3.12 disagrees with Perl-style back-reference
+// semantics. regex-zig follows Perl here (leftmost-first/longest with the
+// capture of the last iteration, empty iterations allowed); GNU grep reports
+// no match. Documented in docs/compatibility/posix_ere.md.
+const known_grep_deviations = [_][]const u8{
+    "b|((c?)){2}\\1$", // back-reference to a group that is repeated and can be empty
+};
+
+fn isKnownDeviation(pattern: []const u8) bool {
+    for (known_grep_deviations) |k| if (std.mem.eql(u8, k, pattern)) return true;
+    return false;
+}
+
+fn checkGrepCases(mode: u8, engine: regex.Engine) !usize {
+    const dialect: regex.Dialect = if (mode == 'E') .posix_ere else .posix_bre;
+    var failures: usize = 0;
+    var lines = std.mem.splitScalar(u8, grep_cases, '\n');
+    var re: ?regex.Regex = null;
+    var s: ?regex.Searcher = null;
+    defer {
+        if (s) |*x| x.deinit();
+        if (re) |*x| x.deinit(gpa);
+    }
+    var pattern: []const u8 = "";
+    var active = false;
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var f = std.mem.splitScalar(u8, line, '\t');
+        const kind = f.next().?;
+        const a = f.next().?;
+        const b = f.rest();
+        if (std.mem.eql(u8, kind, "P")) {
+            if (s) |*x| x.deinit();
+            if (re) |*x| x.deinit(gpa);
+            s = null;
+            re = null;
+            active = a[0] == mode and !isKnownDeviation(b);
+            if (!active) continue;
+            pattern = b;
+            re = regex.Regex.compile(gpa, pattern, .{ .dialect = dialect, .engine = engine }, null) catch |e| {
+                // A forced engine may legitimately refuse (back-references).
+                if (engine != .auto and e == error.Unsupported) {
+                    active = false;
+                    continue;
+                }
+                std.debug.print("COMPILE {s} pattern={s}: {s}\n", .{ @tagName(dialect), pattern, @errorName(e) });
+                failures += 1;
+                active = false;
+                continue;
+            };
+            s = try re.?.searcher(gpa);
+        } else if (active) {
+            const want = a[0] == '1';
+            const got = try s.?.isMatch(b);
+            if (got != want) {
+                std.debug.print("GREP MISMATCH {s}/{s} pattern={s} line=\"{s}\" grep={} ours={}\n", .{ @tagName(dialect), @tagName(engine), pattern, b, want, got });
+                failures += 1;
+            }
+        }
+    }
+    return failures;
+}
+
+test "GNU grep agreement: ERE and BRE on every engine" {
+    var total: usize = 0;
+    for ([_]u8{ 'E', 'B' }) |mode| {
+        for ([_]regex.Engine{ .auto, .pike, .backtrack }) |eng| total += try checkGrepCases(mode, eng);
+    }
+    try std.testing.expectEqual(@as(usize, 0), total);
+}
+
+// ---- robustness: fuzzing and allocation failure -----------------------------------------
+
+test "fuzz: arbitrary patterns and haystacks never crash, and engines agree" {
+    var prng = std.Random.DefaultPrng.init(0xf022);
+    const r = prng.random();
+    // Characters that matter to the parsers, plus some non-ASCII bytes.
+    const pat_chars = "abc.*+?|()[]{}^$\\-,:=!<>&~0123 \n\xc3\xa9\x80\xff";
+    const hay_chars = "abc \n\xc3\xa9\x80\xff1";
+    var compiled: usize = 0;
+    for (0..4000) |_| {
+        var pat_buf: [14]u8 = undefined;
+        const plen = r.uintLessThan(usize, pat_buf.len + 1);
+        for (pat_buf[0..plen]) |*c| c.* = pat_chars[r.uintLessThan(usize, pat_chars.len)];
+        const pat = pat_buf[0..plen];
+        const dialect: regex.Dialect = @fromBackingInt(@intCast(r.uintLessThan(u8, 5)));
+        const opts: regex.Options = .{ .dialect = dialect, .utf8 = r.boolean(), .ignore_case = r.uintLessThan(u8, 4) == 0, .limits = .{ .max_steps = 200_000 } };
+
+        var re = regex.Regex.compile(gpa, pat, opts, null) catch continue;
+        re.deinit(gpa);
+        compiled += 1;
+        var hay_buf: [16]u8 = undefined;
+        const hlen = r.uintLessThan(usize, hay_buf.len + 1);
+        for (hay_buf[0..hlen]) |*c| c.* = hay_chars[r.uintLessThan(usize, hay_chars.len)];
+        const hay = hay_buf[0..hlen];
+
+        // Every engine that accepts the pattern must give the same spans.
+        var first: ?[2]?[2]usize = null;
+        for ([_]regex.Engine{ .auto, .dfa, .pike, .backtrack }) |eng| {
+            var o = opts;
+            o.engine = eng;
+            var e = regex.Regex.compile(gpa, pat, o, null) catch continue;
+            defer e.deinit(gpa);
+            var s = try e.searcher(gpa);
+            defer s.deinit();
+            const m = s.find(hay, 0) catch |err| switch (err) {
+                error.StepLimitExceeded, error.StackLimitExceeded => continue,
+                else => return err,
+            };
+            const got: [2]?[2]usize = .{ if (m) |mm| .{ mm.start(), mm.end() } else null, null };
+            if (first) |f| {
+                if (!std.meta.eql(f[0], got[0])) {
+                    std.debug.print("ENGINE DISAGREE pattern={s} hay={any} dialect={s} utf8={}\n", .{ pat, hay, @tagName(dialect), opts.utf8 });
+                    return error.TestUnexpectedResult;
+                }
+            } else first = got;
+        }
+    }
+    try std.testing.expect(compiled > 300);
+}
+
+test "allocation failure: compile and search clean up and never crash" {
+    const patterns = [_]struct { pat: []const u8, opts: regex.Options }{
+        .{ .pat = "a(b|c)*d", .opts = .{} },
+        .{ .pat = "(a)\\1", .opts = .{} },
+        .{ .pat = "\\p{L}+é", .opts = .{ .utf8 = true } },
+        .{ .pat = "x\\{2,3\\}\\(y\\)", .opts = .{ .dialect = .posix_bre } },
+        .{ .pat = "[a-z&&[^aeiou]]+", .opts = .{ .dialect = .rust } },
+    };
+    for (patterns) |c| {
+        var fail_at: usize = 0;
+        while (true) : (fail_at += 1) {
+            var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+            const a = fa.allocator();
+            var re = regex.Regex.compile(a, c.pat, c.opts, null) catch |e| {
+                try std.testing.expect(e == error.OutOfMemory or e == error.Unsupported);
+                continue;
+            };
+            defer re.deinit(a);
+            var s = re.searcher(a) catch {
+                continue;
+            };
+            defer s.deinit();
+            _ = s.find("xabcd aab éé xxy", 0) catch {};
+            _ = s.count("abcabc") catch {};
+            if (!fa.has_induced_failure) break;
+        }
+        try std.testing.expect(fail_at > 3);
+    }
+}
+
+test "allocation failure: sets and replacement" {
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+        const a = fa.allocator();
+        var set = regex.RegexSet.compile(a, &.{ "ab", "c+", "(d)" }, .{}, null) catch continue;
+        defer set.deinit(a);
+        var s = set.searcher(a) catch continue;
+        defer s.deinit();
+        const out = s.replaceAll(a, "abccd", "<$0>") catch |e| {
+            try std.testing.expect(e == error.OutOfMemory or e == error.InvalidReplacement);
+            continue;
+        };
+        a.free(out);
+        if (!fa.has_induced_failure) break;
+    }
+}

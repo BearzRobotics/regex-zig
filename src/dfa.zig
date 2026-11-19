@@ -90,14 +90,6 @@ pub const Dfa = struct {
 
     pub fn init(gpa: std.mem.Allocator, nfa: program.Nfa, anchored: bool, utf8: bool, first: ?ByteSet, prefix: []const u8, max_bytes: usize) Error!Dfa {
         const n = nfa.insts.len;
-        const dense = try gpa.alloc(u32, n);
-        errdefer gpa.free(dense);
-        const sparse = try gpa.alloc(u32, n);
-        errdefer gpa.free(sparse);
-        const seen_dense = try gpa.alloc(u32, n + 1);
-        errdefer gpa.free(seen_dense);
-        const seen_sparse = try gpa.alloc(u32, n + 1);
-        errdefer gpa.free(seen_sparse);
         var d: Dfa = .{
             .gpa = gpa,
             .insts = nfa.insts,
@@ -112,21 +104,23 @@ pub const Dfa = struct {
             .stride = 0,
             .arena = std.heap.ArenaAllocator.init(gpa),
             .max_bytes = max_bytes,
-            .dense = dense,
-            .sparse = sparse,
-            .seen_dense = seen_dense,
-            .seen_sparse = seen_sparse,
+            .dense = &.{},
+            .sparse = &.{},
+            .seen_dense = &.{},
+            .seen_sparse = &.{},
         };
-        errdefer d.arena.deinit();
+        // From here on `deinit` frees whatever has been allocated so far.
+        errdefer d.deinit();
+        d.dense = try gpa.alloc(u32, n);
+        d.sparse = try gpa.alloc(u32, n);
+        d.seen_dense = try gpa.alloc(u32, n + 1);
+        d.seen_sparse = try gpa.alloc(u32, n + 1);
         d.buildClasses();
         d.stride = d.nclasses + 1;
         // Closures push at most one pending branch per instruction.
         try d.stack.ensureTotalCapacity(gpa, n + 2);
-        errdefer d.stack.deinit(gpa);
         try d.threads.ensureTotalCapacity(gpa, n + 2);
-        errdefer d.threads.deinit(gpa);
         try d.next_seeds.ensureTotalCapacity(gpa, n + 2);
-        errdefer d.next_seeds.deinit(gpa);
         try d.resetCache();
         return d;
     }
@@ -239,10 +233,14 @@ pub const Dfa = struct {
         d.start_ids = .{ null, null, null, null };
         d.used = 0;
         // State 0 is the dead state: no threads, nothing more can match.
-        try d.seeds.append(d.gpa, &.{});
-        try d.kinds.append(d.gpa, .other);
-        try d.nomore.append(d.gpa, true);
-        try d.trans.appendNTimes(d.gpa, 0, d.stride);
+        try d.seeds.ensureUnusedCapacity(d.gpa, 1);
+        try d.kinds.ensureUnusedCapacity(d.gpa, 1);
+        try d.nomore.ensureUnusedCapacity(d.gpa, 1);
+        try d.trans.ensureUnusedCapacity(d.gpa, d.stride);
+        d.seeds.appendAssumeCapacity(&.{});
+        d.kinds.appendAssumeCapacity(.other);
+        d.nomore.appendAssumeCapacity(true);
+        d.trans.appendNTimesAssumeCapacity(0, d.stride);
     }
 
     fn intern(d: *Dfa, seeds: []const u32, kind: Kind, nomore: bool) Error!u32 {
@@ -260,15 +258,22 @@ pub const Dfa = struct {
             d.epoch += 1;
             try d.resetCache();
         }
+        // Reserve everything first so a failed allocation leaves the cache
+        // consistent: either the state is added completely or not at all.
         const a = d.arena.allocator();
         const key = try a.dupe(u8, d.key_buf.items);
         const owned = try a.dupe(u32, seeds);
+        try d.map.ensureUnusedCapacity(d.gpa, 1);
+        try d.seeds.ensureUnusedCapacity(d.gpa, 1);
+        try d.kinds.ensureUnusedCapacity(d.gpa, 1);
+        try d.nomore.ensureUnusedCapacity(d.gpa, 1);
+        try d.trans.ensureUnusedCapacity(d.gpa, d.stride);
         const id: u32 = @intCast(d.seeds.items.len);
-        try d.map.put(d.gpa, key, id);
-        try d.seeds.append(d.gpa, owned);
-        try d.kinds.append(d.gpa, kind);
-        try d.nomore.append(d.gpa, nomore);
-        try d.trans.appendNTimes(d.gpa, unknown, d.stride);
+        d.map.putAssumeCapacity(key, id);
+        d.seeds.appendAssumeCapacity(owned);
+        d.kinds.appendAssumeCapacity(kind);
+        d.nomore.appendAssumeCapacity(nomore);
+        d.trans.appendNTimesAssumeCapacity(unknown, d.stride);
         d.used += cost;
         return id;
     }
