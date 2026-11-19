@@ -11,6 +11,7 @@ Inputs (all from https://www.unicode.org/Public/<version>/ucd/):
     DerivedCoreProperties.txt  Alphabetic, Lowercase, Uppercase
     PropList.txt               White_Space, Join_Control
     PropertyValueAliases.txt   names of General_Category and Script values
+    CaseFolding.txt            simple case folding (statuses C and S)
 
 To regenerate the checked-in file:
 
@@ -37,6 +38,7 @@ FILES = [
     "DerivedCoreProperties.txt",
     "PropList.txt",
     "PropertyValueAliases.txt",
+    "CaseFolding.txt",
 ]
 MAX = 0x10FFFF
 SUR = (0xD800, 0xDFFF)
@@ -142,6 +144,30 @@ def parse_aliases(text, prop):
     return out
 
 
+def parse_case_folding(text):
+    """{cp: folded cp} for the simple foldings (status C and S)."""
+    fold = {}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        f = [x.strip() for x in line.split(";")]
+        if f[1] in ("C", "S"):
+            fold[int(f[0], 16)] = int(f[2], 16)
+    return fold
+
+
+def case_orbits(fold):
+    """Sets of code points that fold to the same code point (size >= 2)."""
+    groups = {}
+    for cp, target in fold.items():
+        assert target not in fold, "folding is not idempotent at %X" % target
+        groups.setdefault(target, {target}).add(cp)
+    rows = sorted(sorted(g) for g in groups.values())
+    assert all(len(r) >= 2 and 0 not in r for r in rows)
+    return rows
+
+
 # ---- generation --------------------------------------------------------------
 
 
@@ -208,6 +234,9 @@ def generate(ucd, out_path):
     bp["Assigned"] = complement(gc["Cn"])
 
     # Derived classes behind \w \d \s (UTS #18, Annex C)
+    orbits = case_orbits(parse_case_folding(read("CaseFolding.txt")))
+    width = max(len(r) for r in orbits)
+
     word = union(bp["Alphabetic"], gc["Mn"], gc["Mc"], gc["Me"], gc["Nd"], gc["Pc"], bp["Join_Control"])
 
     out = []
@@ -254,6 +283,23 @@ def generate(ucd, out_path):
         for k in sorted(m):
             w('    .{ "%s", &%s },\n' % (k, m[k]))
         w("});\n\n")
+
+    # Case folding: rows of `orbit_width` code points (0-padded, ascending),
+    # and a sorted (code point, row) index for lookups.
+    w("/// Code points per row of `orbits`; shorter rows are padded with 0.\n")
+    w("pub const orbit_width = %d;\n\n" % width)
+    w("/// Each row is one set of code points equal under simple case folding.\n")
+    flat = [cp for r in orbits for cp in r + [0] * (width - len(r))]
+    w("pub const orbits = [_]u21{\n")
+    for i in range(0, len(flat), width * 2):
+        w("    " + ", ".join("0x%X" % v for v in flat[i : i + width * 2]) + ",\n")
+    w("};\n\n")
+    index = sorted((cp, i) for i, r in enumerate(orbits) for cp in r)
+    w("/// (code point, row of `orbits`) pairs, sorted by code point.\n")
+    w("pub const orbit_index = [_]u32{\n")
+    for i in range(0, len(index), 6):
+        w("    " + ", ".join("0x%X, %d" % pair for pair in index[i : i + 6]) + ",\n")
+    w("};\n\n")
 
     emit_map("general_category", entries_gc, "gc")
     emit_map("script", entries_sc, "sc")

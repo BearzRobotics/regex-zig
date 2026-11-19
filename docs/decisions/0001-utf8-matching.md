@@ -1,6 +1,6 @@
 # 0001: UTF-8 matching
 
-Status: **Accepted** (decisions in §8). Phase 1 (§9) and phase 2 (§10) are implemented.
+Status: **Accepted** (decisions in §8). Phases 1 to 3 (§9 to §11) are implemented.
 
 Related: SPEC.md §2 goal 4 ("match over bytes by default and over UTF-8 when requested") and §6 (`utf8` option).
 
@@ -144,4 +144,18 @@ Verification done while generating: the General_Category tables partition the 1,
 - `\w` follows UTS #18 Annex C: Alphabetic + Mark + Decimal_Number + Connector_Punctuation + Join_Control.
 - `punct`, `cntrl`, `print`, `graph`, `xdigit` and `ascii` stay ASCII, because their Unicode definitions vary between engines.
 
-**Not done (phase 3).** Unicode case folding. `(?i)` still folds ASCII only.
+
+## 11. Phase 3: case folding, and the tables build option
+
+**Build option.** `zig build -Dunicode_tables=false` (also `b.dependency("regex", .{ .unicode_tables = false })`) leaves the generated tables out. Measured with a small program that compiles a pattern and searches, `zig build-exe -O ReleaseSmall -fstrip`: **356,456 bytes with the tables, 189,248 without** (167 KB). Without them, `\p{..}` is rejected as `Unsupported`, and `utf8` mode keeps ASCII-only `\w \d \s \b`, POSIX classes and case folding. The default is on. `zig build test` passes in both configurations; the tests that need the tables are skipped when they are off.
+
+**Case folding.** Unicode *simple* case folding (CaseFolding.txt statuses C and S), generated into the same tables file. The generator groups the code points that fold to the same target into "orbits" (at most 4 members in Unicode 18.0.0) and emits the rows plus a sorted index.
+
+- A literal under `(?i)` whose character has case variants becomes the set of its variants. Classes are folded after their members are collected and before negation, so `(?i)[^é]` excludes `É`. `\p{..}` under `(?i)` is widened the same way. Folding scans the roughly 1,400 orbits, not the class members, so `(?i)[^a]` costs the same as `(?i)[a]`.
+- Back-references under `(?i)` compare characters, not bytes, so `(k)\1` matches `k` followed by KELVIN SIGN even though the two differ in length.
+- Full case folding (one character folding to several, such as ß to ss) is not supported. `(?i)straße` does not match `STRASSE`.
+- Unicode folding brings in non-ASCII variants of two ASCII letters (`k`: U+212A, `s`: U+017F), as UTS #18 requires and Rust's `regex` does. Those literals are no longer ASCII-only sets in `utf8` mode.
+
+**Look-behind.** `fixedWidth` now accepts a character set whose members all encode to the same length, so `(?i)(?<=é)` and `(?<=[à-ü])` work in `utf8` mode. A case-insensitive `(?<=k)` or `(?<=s)` is rejected (the variants are 1 and 3, or 1 and 2, bytes). Per-length alternatives would lift this; not done.
+
+**Testing.** Orbit invariants (every row ascending, every member finds its row), the examples above, both byte-mode and tables-off behaviour.

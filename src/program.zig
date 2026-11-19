@@ -319,7 +319,18 @@ fn fixedWidth(n: *const ast.Node, utf8_mode: bool) ?u32 {
         .byte, .set => 1,
         // A scalar value is 1 to 4 bytes long.
         .any => if (utf8_mode) null else 1,
-        .cp_set => null,
+        // Fixed only when every range stays within one encoded length, and
+        // all ranges share it (for example a class of two-byte letters).
+        .cp_set => |ranges| blk: {
+            var width: ?u32 = null;
+            for (ranges) |r| {
+                const lo_len = std.unicode.utf8CodepointSequenceLength(r.lo) catch break :blk null;
+                const hi_len = std.unicode.utf8CodepointSequenceLength(r.hi) catch break :blk null;
+                if (lo_len != hi_len or (width != null and width.? != lo_len)) break :blk null;
+                width = lo_len;
+            }
+            break :blk width;
+        },
         .concat => |items| blk: {
             var total: u32 = 0;
             for (items) |it| total +|= fixedWidth(it, utf8_mode) orelse break :blk null;

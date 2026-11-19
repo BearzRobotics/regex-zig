@@ -219,13 +219,10 @@ pub const Searcher = struct {
                     // A group that did not participate makes the reference fail.
                     if (a == unset or e == unset) {
                         ok = false;
-                    } else {
-                        const len = e - a;
-                        if (hay.len - pos >= len and eqlBytes(hay[a..e], hay[pos..][0..len], b.ignore_case)) {
-                            pos += len;
-                            pc += 1;
-                        } else ok = false;
-                    }
+                    } else if (backrefLen(hay, a, e, pos, b.ignore_case, s.prog.utf8)) |n| {
+                        pos += n;
+                        pc += 1;
+                    } else ok = false;
                 },
                 .atomic_start => {
                     try s.push(.{ .marker = .{ .kind = .atomic, .pos = pos, .resume_pc = 0 } });
@@ -319,6 +316,34 @@ fn wordAfter(hay: []const u8, pos: usize, utf8_mode: bool) bool {
     if (!utf8_mode or hay[pos] < 0x80) return ByteSet.isWordByte(hay[pos]);
     const d = decodeAt(hay, pos) orelse return false;
     return unicode.isWord(d.cp);
+}
+
+/// Length of the text at `pos` that equals the captured text hay[a..e], or
+/// null. Case-insensitive comparison in utf8 mode works on characters (simple
+/// case folding), so the two texts may differ in byte length.
+fn backrefLen(hay: []const u8, a: usize, e: usize, pos: usize, ignore_case: bool, utf8_mode: bool) ?usize {
+    if (!ignore_case or !utf8_mode) {
+        const len = e - a;
+        if (hay.len - pos >= len and eqlBytes(hay[a..e], hay[pos..][0..len], ignore_case)) return len;
+        return null;
+    }
+    var i = a;
+    var j = pos;
+    while (i < e) {
+        const x = decodeAt(hay, i);
+        const y = decodeAt(hay, j);
+        if (x != null and y != null and i + x.?.len <= e) {
+            if (!unicode.eqlFold(x.?.cp, y.?.cp)) return null;
+            i += x.?.len;
+            j += y.?.len;
+        } else {
+            // Not a whole character: compare the bytes themselves.
+            if (j >= hay.len or hay[j] != hay[i]) return null;
+            i += 1;
+            j += 1;
+        }
+    }
+    return j - pos;
 }
 
 fn eqlBytes(a: []const u8, b: []const u8, ignore_case: bool) bool {

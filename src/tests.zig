@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const regex = @import("root.zig");
+const unicode = @import("unicode.zig");
 
 const gpa = std.testing.allocator;
 
@@ -416,8 +417,12 @@ test "utf8: dot and classes consume whole characters" {
     try expectU8("[é]", "caf\u{e9}", .{ 3, 5 });
     try expectU8("[à-ü]+", "xéüy", .{ 1, 5 });
     try expectU8("[^à-ü]", "éa", .{ 2, 3 });
-    try expectU8("^\\W$", "☺", .{ 0, 3 });
-    try expectU8("^\\W$", "é", null); // \w is Unicode-aware in utf8 mode
+    if (unicode.enabled) {
+        try expectU8("^\\W$", "☺", .{ 0, 3 });
+        try expectU8("^\\W$", "é", null); // \w is Unicode-aware in utf8 mode
+    } else {
+        try expectU8("^\\W$", "é", .{ 0, 2 }); // ASCII-only without the tables
+    }
     try expectU8("^\\D$", "☺", .{ 0, 3 });
     // The same patterns keep their byte meaning without utf8.
     try expectSpan("^.$", "é", null);
@@ -516,6 +521,7 @@ test "utf8: program size for . and [^a]" {
 // ---- utf8 mode: Unicode properties and classes (phase 2) ---------------------
 
 test "utf8: \\w \\d \\s are Unicode-aware" {
+    if (!unicode.enabled) return error.SkipZigTest;
     try expectU8("^\\w+$", "café_9", .{ 0, 7 });
     try expectU8("^\\w+$", "漢字", .{ 0, 6 });
     try expectU8("^\\w$", "\u{300}", .{ 0, 2 }); // combining mark
@@ -529,6 +535,7 @@ test "utf8: \\w \\d \\s are Unicode-aware" {
 }
 
 test "utf8: \\p and \\P" {
+    if (!unicode.enabled) return error.SkipZigTest;
     try expectU8("^\\p{L}+$", "héllo", .{ 0, 6 });
     try expectU8("^\\pL+$", "héllo", .{ 0, 6 });
     try expectU8("\\p{Lu}", "aÉb", .{ 1, 3 });
@@ -553,6 +560,10 @@ test "utf8: \\p and \\P" {
 }
 
 test "utf8: \\p errors" {
+    if (!unicode.enabled) {
+        try expectCompileError("\\p{L}", u8opts, error.Unsupported);
+        return;
+    }
     try expectCompileError("\\p{NoSuchThing}", u8opts, error.InvalidPattern);
     try expectCompileError("\\p{L", u8opts, error.InvalidPattern);
     try expectCompileError("\\p", u8opts, error.InvalidPattern);
@@ -562,6 +573,7 @@ test "utf8: \\p errors" {
 }
 
 test "utf8: POSIX classes use Unicode where it is clear" {
+    if (!unicode.enabled) return error.SkipZigTest;
     try expectU8("^[[:alpha:]]+$", "héllo", .{ 0, 6 });
     try expectU8("^[[:upper:]]$", "É", .{ 0, 2 });
     try expectU8("^[[:lower:]]$", "é", .{ 0, 2 });
@@ -576,6 +588,7 @@ test "utf8: POSIX classes use Unicode where it is clear" {
 }
 
 test "utf8: \\b is Unicode-aware" {
+    if (!unicode.enabled) return error.SkipZigTest;
     try withSearcher("\\bcafé\\b", u8opts, struct {
         fn f(s: *regex.Searcher) anyerror!void {
             try std.testing.expect(try s.isMatch("un café noir"));
@@ -605,6 +618,7 @@ test "utf8: \\b is Unicode-aware" {
 }
 
 test "utf8: large classes stay small and run in one step per character" {
+    if (!unicode.enabled) return error.SkipZigTest;
     var re = try regex.Regex.compile(gpa, "\\p{L}+", u8opts, null);
     defer re.deinit(gpa);
     // The set is far too big to lower to byte sequences; it uses cp_class.
@@ -621,6 +635,7 @@ test "utf8: large classes stay small and run in one step per character" {
 }
 
 test "utf8: invalid bytes never match a property class" {
+    if (!unicode.enabled) return error.SkipZigTest;
     const bad = [_][]const u8{ "\xff", "\x80", "\xc3", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xe2\x82" };
     for (bad) |h| {
         try expectU8("^\\p{L}$", h, null);
@@ -632,6 +647,7 @@ test "utf8: invalid bytes never match a property class" {
 }
 
 test "utf8: Unicode classes on captures and replacement" {
+    if (!unicode.enabled) return error.SkipZigTest;
     try withSearcher("(\\p{Lu})(\\p{Ll}+)", u8opts, struct {
         fn f(s: *regex.Searcher) anyerror!void {
             const out = try s.replaceAll(gpa, "Émile et Zoé", "$2$1");
@@ -639,4 +655,76 @@ test "utf8: Unicode classes on captures and replacement" {
             try std.testing.expectEqualStrings("mileÉ et oéZ", out);
         }
     }.f);
+}
+
+// ---- utf8 mode: case-insensitive matching (phase 3) ---------------------------
+
+const u8i: regex.Options = .{ .utf8 = true, .ignore_case = true };
+
+fn expectU8i(pattern: []const u8, hay: []const u8, want: ?[2]usize) !void {
+    try expectSpanOpts(pattern, hay, want, u8i);
+}
+
+test "utf8: case-insensitive literals use Unicode simple case folding" {
+    if (!unicode.enabled) return error.SkipZigTest;
+    try expectU8i("é", "É", .{ 0, 2 });
+    try expectU8i("É", "é", .{ 0, 2 });
+    try expectU8i("straße", "STRASSE", null); // full folding (ß -> ss) is not supported
+    try expectU8i("ß", "\u{1E9E}", .{ 0, 3 }); // capital sharp s
+    try expectU8i("σ", "Σς", .{ 0, 2 });
+    try expectU8i("ς", "Σ", .{ 0, 2 });
+    try expectU8i("привет", "ПРИВЕТ", .{ 0, 12 });
+    try expectU8i("k", "\u{212A}", .{ 0, 3 }); // KELVIN SIGN
+    try expectU8i("\u{212A}", "k", .{ 0, 1 });
+    try expectU8i("s", "\u{17F}", .{ 0, 2 }); // LONG S
+    try expectU8i("abc", "xABCx", .{ 1, 4 });
+    try expectU8i("é+", "éÉé", .{ 0, 6 });
+    try expectU8i("\\x{E9}", "É", .{ 0, 2 });
+    // Inline flags and byte mode.
+    try expectU8("(?i)é", "É", .{ 0, 2 });
+    try expectU8("(?i:é)É", "ÉÉ", .{ 0, 4 });
+    try expectU8("é(?i)", "É", null);
+    try expectSpanOpts("é", "É", null, .{ .ignore_case = true }); // byte mode folds ASCII only
+}
+
+test "utf8: case-insensitive classes fold before negation" {
+    if (!unicode.enabled) return error.SkipZigTest;
+    try expectU8i("^[à-ü]+$", "ÉÈ", .{ 0, 4 });
+    try expectU8i("^[a-c]+$", "ABC", .{ 0, 3 });
+    try expectU8i("[k]", "\u{212A}", .{ 0, 3 });
+    try expectU8i("[^é]", "É", null);
+    try expectU8i("[^é]", "e", .{ 0, 1 });
+    try expectU8i("^[^k]$", "\u{212A}", null);
+    try expectU8i("^\\p{Lu}+$", "abcé", .{ 0, 5 }); // (?i) widens \p{Lu}
+    try expectU8i("^\\p{Ll}+$", "ABCÉ", .{ 0, 5 });
+    try expectU8i("^[[:upper:]]+$", "abc", .{ 0, 3 });
+    // Without (?i) nothing changes.
+    try expectU8("^[à-ü]+$", "ÉÈ", null);
+    try expectU8("^\\p{Lu}+$", "abc", null);
+}
+
+test "utf8: case-insensitive back-references compare characters" {
+    if (!unicode.enabled) return error.SkipZigTest;
+    try expectU8i("(é)\\1", "éÉ", .{ 0, 4 });
+    try expectU8i("(k)\\1", "k\u{212A}", .{ 0, 4 }); // 1 byte then 3 bytes
+    try expectU8i("(\\x{212A})\\1", "\u{212A}k", .{ 0, 4 }); // 3 bytes then 1 byte
+    try expectU8i("(é)\\1", "éa", null);
+    try expectU8i("(.+)\\1", "ÀBcàbC", .{ 0, 8 });
+    try expectSpanOpts("(a)\\1", "aA", .{ 0, 2 }, .{ .ignore_case = true });
+}
+
+test "utf8: case folding and look-behind" {
+    if (!unicode.enabled) return error.SkipZigTest;
+    try expectU8i("(?<=a)x", "Ax", .{ 1, 2 }); // ASCII-only variants: fixed width
+    try expectU8i("(?<=é)x", "Éx", .{ 2, 3 }); // both variants are 2 bytes
+    try expectU8("(?<=[à-ü])x", "éx", .{ 2, 3 });
+    // 'k' and 's' have variants of different lengths, so the width is not fixed.
+    try expectCompileError("(?<=s)x", u8i, error.Unsupported);
+}
+
+test "utf8: without the tables case folding is ASCII-only" {
+    if (unicode.enabled) return error.SkipZigTest;
+    try expectU8i("abc", "ABC", .{ 0, 3 });
+    try expectU8i("é", "É", null);
+    try expectU8i("k", "\u{212A}", null);
 }

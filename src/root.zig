@@ -3,8 +3,9 @@
 //! Current state: the Perl, Oniguruma and POSIX ERE parsers and the bounded
 //! backtracking engine, with isMatch/matches/count/findAll/split/replaceAll
 //! helpers on Searcher (ops.zig), and UTF-8 matching (Options.utf8) with Unicode
-//! properties. POSIX BRE, the Rust dialect, the linear-time engine, Unicode
-//! case folding, and streaming are not implemented yet.
+//! properties and simple case folding (-Dunicode_tables=false leaves the
+//! tables out). POSIX BRE, the Rust dialect, the linear-time engine, full case
+//! folding and streaming are not implemented yet.
 
 const std = @import("std");
 const parse = @import("parse.zig");
@@ -30,8 +31,9 @@ pub const Options = struct {
     /// negation and `\x{...}` work on Unicode scalar values. Invalid UTF-8 in
     /// the haystack never matches `.` or a class and never causes a crash.
     /// Also makes `\p{..}`, `\w \d \s \b` and the common POSIX classes
-    /// Unicode-aware. See docs/decisions/0001-utf8-matching.md for what is not
-    /// covered yet (case folding).
+    /// Unicode-aware, and `ignore_case` / `(?i)` uses Unicode simple case
+    /// folding. See docs/decisions/0001-utf8-matching.md for what is not
+    /// covered (full case folding).
     utf8: bool = false,
     limits: Limits = .{},
 };

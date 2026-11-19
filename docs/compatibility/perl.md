@@ -32,18 +32,27 @@ conditionals, recursion, callouts.
 
 ## Known gaps and deviations
 
-- Byte matching by default: `.` consumes one byte, and `\p{..}` is rejected. With
-  `Options.utf8` the pattern must be valid UTF-8 and matching is over Unicode
-  scalar values: `.`, classes, negation, `\x{...}`, `\p{..}` / `\P{..}`
-  (General_Category, Script, Alphabetic, Lowercase, Uppercase, White_Space, Any,
-  ASCII, Assigned; Unicode 18.0.0), `\w \d \s \b` (UTS #18 Annex C definitions)
-  and the POSIX classes alpha, alnum, upper, lower, digit, space, word and blank.
-  Still ASCII-only in `utf8` mode: punct, cntrl, print, graph, xdigit, ascii and
-  `\h`; case-insensitive matching folds ASCII only (so `(?i)é` does not match
-  `É`, and `(?i)\p{Lu}` is not widened); `\p{Script_Extensions=..}` and other
-  properties are rejected. Look-behind must have a fixed width in bytes
-  (`(?<=.)` is rejected). A match never starts inside a character; invalid UTF-8
-  in the haystack never matches `.` or a class and is not a word character.
+- Byte matching by default: `.` consumes one byte, `\p{..}` is rejected, and
+  `(?i)` folds ASCII letters only. With `Options.utf8` the pattern must be valid
+  UTF-8 and matching is over Unicode scalar values: `.`, classes, negation,
+  `\x{...}`, `\p{..}` / `\P{..}` (General_Category, Script, Alphabetic,
+  Lowercase, Uppercase, White_Space, Any, ASCII, Assigned; Unicode 18.0.0),
+  `\w \d \s \b` (UTS #18 Annex C definitions), the POSIX classes alpha, alnum,
+  upper, lower, digit, space, word and blank, and case-insensitive matching by
+  Unicode *simple* case folding (literals, classes, `\p{..}` and back-references;
+  `(?i)k` also matches KELVIN SIGN, `(?i)s` also matches LONG S). Full folding,
+  where one character folds to several (ß to ss), is not supported.
+- Still ASCII-only in `utf8` mode: punct, cntrl, print, graph, xdigit, ascii and
+  `\h`. `\p{Script_Extensions=..}` and other properties are rejected.
+- Look-behind must have a fixed width in bytes. In `utf8` mode `(?<=.)` is
+  rejected, and so is a case-insensitive `(?<=s)` or `(?<=k)`, whose variants
+  have different encoded lengths; `(?<=a)`, `(?<=é)` with `(?i)`, and `(?<=[à-ü])`
+  are fine.
+- A match never starts inside a character; invalid UTF-8 in the haystack never
+  matches `.` or a class and is not a word character.
+- Building with `-Dunicode_tables=false` leaves out the Unicode tables (about
+  167 KB less in a ReleaseSmall executable): `\p{..}` is then rejected, and
+  `utf8` mode keeps ASCII-only `\w \d \s \b`, POSIX classes and case folding.
 - Each `split` pushes a stack frame, so `.*` over an N-byte line needs N
   frames (default cap 4M). Single-byte-loop specialisation is planned.
 - Back-reference to a group that did not participate fails (Oniguruma and

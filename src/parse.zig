@@ -18,8 +18,8 @@
 //! and `.` and negated classes consume one byte. With `utf8` set the pattern
 //! must be valid UTF-8 and literals, `.`, classes, negation and `\x{...}`
 //! work on Unicode scalar values (docs/decisions/0001-utf8-matching.md).
-//! In that mode \p{..}, \w, \d, \s and the common POSIX classes use the
-//! Unicode tables; \p{..} without `utf8` is reported as unsupported rather
+//! In that mode \p{..}, \w, \d, \s, the common POSIX classes and (?i) use
+//! the Unicode tables (unless built with -Dunicode_tables=false); \p{..} without `utf8` is reported as unsupported rather
 //! than ignored (SPEC §5).
 
 const std = @import("std");
@@ -147,6 +147,13 @@ const Parser = struct {
 
     /// A literal scalar value. Outside utf8 mode `cp` is always a byte.
     fn literalCp(p: *Parser, cp: u21) Error!*const Node {
+        if (p.flags.ignore_case and p.utf8 and unicode.enabled and unicode.orbit(cp) != null) {
+            // Case-insensitive: the character and its case variants.
+            var cls: Class = .{};
+            try p.classAddCp(&cls, cp);
+            try p.classFoldCase(&cls);
+            return p.classNode(&cls);
+        }
         if (!p.utf8 or cp < 0x80) return p.literal(@intCast(cp));
         var buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
@@ -164,7 +171,7 @@ const Parser = struct {
             const d = p.decodeAt(i);
             return .{ .node = try p.literalCp(d.cp), .len = d.len };
         }
-        return .{ .node = try p.literal(c), .len = 1 };
+        return .{ .node = if (p.utf8) try p.literalCp(c) else try p.literal(c), .len = 1 };
     }
 
     fn classAddRange(p: *Parser, cls: *Class, lo: u21, hi: u21) Error!void {
@@ -216,6 +223,7 @@ const Parser = struct {
     /// past the `p` or `P`.
     fn propertyClass(p: *Parser, negated: bool, at: usize) Error!Class {
         if (!p.utf8) return p.fail(error.Unsupported, at, "Unicode property \\p{...} needs utf8 mode");
+        if (!unicode.enabled) return p.fail(error.Unsupported, at, "Unicode property \\p{...}: built without -Dunicode_tables");
         var neg = negated;
         var name: []const u8 = undefined;
         if (p.eat('{')) {
@@ -237,6 +245,29 @@ const Parser = struct {
         var cls: Class = .{};
         try p.classAddTable(&cls, table, neg);
         return cls;
+    }
+
+    /// Adds the case variants of every member of `cls`. In utf8 mode with the
+    /// Unicode tables this is simple case folding (so `k` brings in KELVIN
+    /// SIGN); otherwise only ASCII letters are folded. Full folding, where one
+    /// character folds to several (ß to ss), is not supported.
+    fn classFoldCase(p: *Parser, cls: *Class) Error!void {
+        if (!p.utf8 or !unicode.enabled) {
+            cls.bytes.addAsciiCaseCounterparts();
+            return;
+        }
+        try ucp.normalize(p.arena, &cls.ranges);
+        // Collect first: adding while scanning would unsort `ranges`.
+        var additions: std.ArrayList(u21) = .empty;
+        for (0..unicode.orbitCount()) |r| {
+            const row = unicode.orbitRow(r);
+            var any = false;
+            for (row) |cp| {
+                if (cp < 0x80) any = any or cls.bytes.has(@intCast(cp)) else any = any or ucp.containsRange(cls.ranges.items, cp);
+            }
+            if (any) try additions.appendSlice(p.arena, row);
+        }
+        for (additions.items) |cp| try p.classAddCp(cls, cp);
     }
 
     fn classNode(p: *Parser, cls: *Class) Error!*const Node {
@@ -582,7 +613,7 @@ const Parser = struct {
     /// The class for \d \w \s \h and their negations, or null for any other letter.
     fn classEscape(p: *Parser, c: u8) Error!?Class {
         var s: ByteSet = .{};
-        if (p.utf8) {
+        if (p.utf8 and unicode.enabled) {
             // Unicode-aware in utf8 mode (UTS #18, Annex C).
             const table: ?unicode.Table = switch (std.ascii.toLower(c)) {
                 'd' => unicode.digit,
@@ -702,6 +733,7 @@ const Parser = struct {
             'G' => return try p.node(.{ .assertion = .search_start }),
             'p', 'P' => {
                 var cls = try p.propertyClass(c == 'P', at);
+                if (p.flags.ignore_case) try p.classFoldCase(&cls);
                 return try p.classNode(&cls);
             },
             'R', 'X', 'K', 'C' => return p.fail(error.Unsupported, at, "unsupported escape"),
@@ -814,7 +846,7 @@ const Parser = struct {
                 try p.classAddRange(&cls, lo, hi);
             } else try p.classAddCp(&cls, lo);
         }
-        if (p.flags.ignore_case) cls.bytes.addAsciiCaseCounterparts();
+        if (p.flags.ignore_case) try p.classFoldCase(&cls);
         if (negate) try p.classInvert(&cls);
         return cls;
     }
@@ -890,7 +922,7 @@ const Parser = struct {
         var name = p.src[start + 2 .. end];
         const neg = name.len > 0 and name[0] == '^';
         if (neg) name = name[1..];
-        if (p.utf8) if (try p.posixUnicodeClass(name, neg)) |cls| {
+        if (p.utf8 and unicode.enabled) if (try p.posixUnicodeClass(name, neg)) |cls| {
             p.pos = end + 2;
             return cls;
         };
