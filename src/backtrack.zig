@@ -10,6 +10,7 @@ const ByteSet = @import("byteset.zig").ByteSet;
 const ops = @import("ops.zig");
 const context = @import("context.zig");
 const pike = @import("pike.zig");
+const dfa = @import("dfa.zig");
 const utf8 = @import("utf8.zig");
 const unicode = @import("unicode.zig");
 
@@ -68,6 +69,10 @@ pub const Searcher = struct {
     have_best: bool = false,
     /// The Pike VM, when the program was compiled for it (see Program.engine).
     pike: ?pike.Pike = null,
+    /// The lazy DFA pair, when Program.engine is .dfa: forward finds where a
+    /// match ends, reverse where it starts.
+    fwd: ?dfa.Dfa = null,
+    rev: ?dfa.Dfa = null,
     stack: std.ArrayList(Frame) = .empty,
     steps: u64 = 0,
     /// Position recorded by the marker most recently removed by cutToMarker.
@@ -87,20 +92,31 @@ pub const Searcher = struct {
         if (prog.longest and prog.engine == .backtrack) best = try gpa.alloc(usize, prog.reg_count);
         errdefer if (best.len > 0) gpa.free(best);
         var vm: ?pike.Pike = null;
-        if (prog.engine == .pike) vm = try pike.Pike.init(gpa, prog);
-        return .{ .gpa = gpa, .prog = prog, .limits = limits, .regs = regs, .best = best, .pike = vm };
+        if (prog.engine == .pike or prog.engine == .dfa) vm = try pike.Pike.init(gpa, prog);
+        errdefer if (vm) |*v| v.deinit();
+        var fwd: ?dfa.Dfa = null;
+        var rev: ?dfa.Dfa = null;
+        if (prog.engine == .dfa) {
+            fwd = try dfa.Dfa.init(gpa, prog.nfa.?, false, prog.utf8, prog.first_bytes, limits.max_dfa_cache);
+            errdefer if (fwd) |*f| f.deinit();
+            rev = try dfa.Dfa.init(gpa, prog.reverse_nfa.?, true, prog.utf8, null, limits.max_dfa_cache);
+        }
+        return .{ .gpa = gpa, .prog = prog, .limits = limits, .regs = regs, .best = best, .pike = vm, .fwd = fwd, .rev = rev };
     }
 
     pub fn deinit(s: *Searcher) void {
         s.gpa.free(s.regs);
         if (s.best.len > 0) s.gpa.free(s.best);
         if (s.pike) |*vm| vm.deinit();
+        if (s.fwd) |*f| f.deinit();
+        if (s.rev) |*r| r.deinit();
         s.stack.deinit(s.gpa);
     }
 
     /// Leftmost match at or after `from`. The returned Match borrows the
     /// searcher's registers and is valid until the next call.
     pub fn find(s: *Searcher, hay: []const u8, from: usize) MatchError!?Match {
+        if (s.fwd != null) return s.findDfa(hay, from);
         if (s.pike) |*vm| {
             const regs = vm.find(hay, from) orelse return null;
             return .{ .regs = regs };
@@ -122,6 +138,52 @@ pub const Searcher = struct {
             if (try s.run(hay, start, from)) return .{ .regs = s.regs };
         }
         return null;
+    }
+
+    fn findPike(s: *Searcher, hay: []const u8, from: usize) ?Match {
+        const regs = s.pike.?.find(hay, from) orelse return null;
+        return .{ .regs = regs };
+    }
+
+    /// The DFA cannot be used when `$` or `\Z` could match before a final newline.
+    fn dfaApplies(s: *const Searcher, hay: []const u8) bool {
+        return !(s.prog.final_newline_assertion and hay.len > 0 and hay[hay.len - 1] == '\n');
+    }
+
+    /// The span from the DFAs, then the Pike VM only when captures are needed.
+    fn findDfa(s: *Searcher, hay: []const u8, from: usize) MatchError!?Match {
+        if (!s.dfaApplies(hay)) return s.findPike(hay, from);
+        const end = (s.fwd.?.findEnd(hay, from, false) catch |e| switch (e) {
+            error.GaveUp => return s.findPike(hay, from),
+            error.OutOfMemory => return error.OutOfMemory,
+        }) orelse return null;
+        // Leftmost-longest: the DFA found that a match exists; its span follows
+        // a rule the DFA does not implement.
+        if (s.prog.longest) return s.findPike(hay, from);
+        const start = (s.rev.?.findStart(hay, from, end) catch |e| switch (e) {
+            error.GaveUp => return s.findPike(hay, from),
+            error.OutOfMemory => return error.OutOfMemory,
+        }) orelse return s.findPike(hay, from);
+        if (s.prog.group_count == 0) {
+            s.regs[0] = start;
+            s.regs[1] = end;
+            return .{ .regs = s.regs };
+        }
+        return s.findPike(hay, start);
+    }
+
+    /// True if there is a match anywhere (the grep question), without
+    /// computing where.
+    pub fn matchesAnywhere(s: *Searcher, hay: []const u8) MatchError!bool {
+        if (s.fwd != null and s.dfaApplies(hay)) {
+            if (s.fwd.?.findEnd(hay, 0, true) catch |e| switch (e) {
+                error.GaveUp => null,
+                error.OutOfMemory => return error.OutOfMemory,
+            }) |_| return true;
+            // null: either no match, or the DFA gave up; only the first is final.
+            if (s.fwd.?.search_flushes <= 4) return false;
+        }
+        return (try s.find(hay, 0)) != null;
     }
 
     fn push(s: *Searcher, f: Frame) MatchError!void {

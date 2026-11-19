@@ -41,6 +41,10 @@ pub const Limits = struct {
     max_steps: u64 = 10_000_000,
     /// Backtrack-stack frames allowed.
     max_stack: usize = 4 * 1024 * 1024,
+    /// Bytes of states and transitions the lazy DFA may cache per direction.
+    /// When full the cache is cleared; if that keeps happening the search
+    /// falls back to the Pike VM.
+    max_dfa_cache: usize = 2 * 1024 * 1024,
 };
 
 pub const Error = error{

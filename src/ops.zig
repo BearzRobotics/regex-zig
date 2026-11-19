@@ -22,7 +22,7 @@ pub const ReplaceError = MatchError || error{
 
 /// True if the pattern matches anywhere in `hay`.
 pub fn isMatch(s: *Searcher, hay: []const u8) MatchError!bool {
-    return (try s.find(hay, 0)) != null;
+    return s.matchesAnywhere(hay);
 }
 
 /// Iterates over successive, non-overlapping matches. Each Match borrows the

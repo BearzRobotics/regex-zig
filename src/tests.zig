@@ -24,8 +24,8 @@ fn span(pattern: []const u8, hay: []const u8, opts: regex.Options) !?[2]usize {
     const got: ?[2]usize = if (m) |mm| .{ mm.start(), mm.end() } else null;
 
     // Every behaviour test doubles as a differential test: when the default
-    // engine is the Pike VM, the backtracker must give the same span.
-    if (opts.engine == .auto and re.prog.engine == .pike) {
+    // engine is not the backtracker, the backtracker must give the same span.
+    if (opts.engine == .auto and re.prog.engine != .backtrack) {
         var bo = opts;
         bo.engine = .backtrack;
         var bre = try regex.Regex.compile(gpa, pattern, bo, null);
@@ -832,7 +832,10 @@ test "posix_ere is leftmost-longest" {
 test "the engine is chosen from the pattern, and can be forced" {
     var plain = try regex.Regex.compile(gpa, "a(b|c)*d", .{}, null);
     defer plain.deinit(gpa);
-    try std.testing.expect(plain.prog.engine == .pike);
+    try std.testing.expect(plain.prog.engine == .dfa);
+    var no_dfa = try regex.Regex.compile(gpa, "a(b|c)*d", .{ .engine = .pike }, null);
+    defer no_dfa.deinit(gpa);
+    try std.testing.expect(no_dfa.prog.engine == .pike);
 
     for ([_][]const u8{ "(a)\\1", "a(?=b)", "(?<=a)b", "(?>a+)b", "a++b" }) |needs_bt| {
         var re = try regex.Regex.compile(gpa, needs_bt, .{}, null);
@@ -917,43 +920,54 @@ const Gen = struct {
 };
 
 fn expectSameResult(pattern: []const u8, opts: regex.Options, compare_groups: bool, hay: []const u8) !void {
-    var po = opts;
-    po.engine = .pike;
+    try expectSameEngines(pattern, opts, .pike, .backtrack, compare_groups, hay);
+}
+
+/// Every match of an iteration over `hay` is the same under both engines
+/// (so empty matches and searches from a position other than 0 are covered).
+fn expectSameEngines(pattern: []const u8, opts: regex.Options, a: regex.Engine, b: regex.Engine, compare_groups: bool, hay: []const u8) !void {
+    var ao = opts;
+    ao.engine = a;
     var bo = opts;
-    bo.engine = .backtrack;
-    var pre = try regex.Regex.compile(gpa, pattern, po, null);
-    defer pre.deinit(gpa);
+    bo.engine = b;
+    var are = try regex.Regex.compile(gpa, pattern, ao, null);
+    defer are.deinit(gpa);
     var bre = try regex.Regex.compile(gpa, pattern, bo, null);
     defer bre.deinit(gpa);
-    var ps = try pre.searcher(gpa);
-    defer ps.deinit();
+    var as = try are.searcher(gpa);
+    defer as.deinit();
     var bs = try bre.searcher(gpa);
     defer bs.deinit();
 
-    // Every match of an iteration, so empty matches and from > 0 are covered.
-    var pit = ps.matches(hay);
+    // isMatch must agree with find.
+    const exists = try as.isMatch(hay);
+    const bexists = try bs.isMatch(hay);
+    if (exists != bexists) {
+        std.debug.print("ISMATCH MISMATCH pattern={s} hay={any} {s}={} {s}={}\n", .{ pattern, hay, @tagName(a), exists, @tagName(b), bexists });
+        return error.TestUnexpectedResult;
+    }
+
+    var ait = as.matches(hay);
     var bit = bs.matches(hay);
     while (true) {
-        const pm = try pit.next();
+        const am = try ait.next();
         const bm = try bit.next();
-        if (pm == null or bm == null) {
-            if ((pm == null) != (bm == null)) {
-                std.debug.print("MISMATCH pattern={s} hay={any} (pike null={}, backtrack null={})\n", .{ pattern, hay, pm == null, bm == null });
+        if (am == null or bm == null) {
+            if ((am == null) != (bm == null)) {
+                std.debug.print("MISMATCH pattern={s} hay={any} ({s} null={}, {s} null={})\n", .{ pattern, hay, @tagName(a), am == null, @tagName(b), bm == null });
                 return error.TestUnexpectedResult;
             }
             break;
         }
-        if (pm.?.start() != bm.?.start() or pm.?.end() != bm.?.end()) {
-            std.debug.print("MISMATCH pattern={s} hay={s} pike={d}..{d} backtrack={d}..{d}\n", .{ pattern, hay, pm.?.start(), pm.?.end(), bm.?.start(), bm.?.end() });
+        if (am.?.start() != bm.?.start() or am.?.end() != bm.?.end()) {
+            std.debug.print("MISMATCH pattern={s} hay={any} {s}={d}..{d} {s}={d}..{d}\n", .{ pattern, hay, @tagName(a), am.?.start(), am.?.end(), @tagName(b), bm.?.start(), bm.?.end() });
             return error.TestUnexpectedResult;
         }
         if (compare_groups) {
             var g: u32 = 1;
-            while (g <= pre.groupCount()) : (g += 1) {
-                const a = pm.?.group(g);
-                const b = bm.?.group(g);
-                if (!std.meta.eql(a, b)) {
-                    std.debug.print("GROUP MISMATCH pattern={s} hay={s} group={d}\n", .{ pattern, hay, g });
+            while (g <= are.groupCount()) : (g += 1) {
+                if (!std.meta.eql(am.?.group(g), bm.?.group(g))) {
+                    std.debug.print("GROUP MISMATCH pattern={s} hay={any} group={d}\n", .{ pattern, hay, g });
                     return error.TestUnexpectedResult;
                 }
             }
@@ -993,5 +1007,80 @@ test "differential: utf8 patterns agree between the engines" {
     const hays = [_][]const u8{ "", "abc é☺ Éa", "日本語 text", "\xff\x80é\xc3", "KkK\u{212A} ſs", "٣٤ 12", "😀x😀" };
     for (patterns) |pat| {
         for (hays) |h| try expectSameResult(pat, .{ .utf8 = true }, true, h);
+    }
+}
+
+test "differential: the lazy DFA agrees with the Pike VM on random patterns" {
+    var prng = std.Random.DefaultPrng.init(0xdfa);
+    const r = prng.random();
+    const alphabet = "abc\n";
+    var compared: usize = 0;
+    for ([_]regex.Dialect{ .perl, .posix_ere, .oniguruma }) |dialect| {
+        for (0..1500) |_| {
+            var g: Gen = .{ .r = r, .ere = dialect == .posix_ere };
+            defer g.out.deinit(gpa);
+            try g.alt(2);
+            // Skip what the parser rejects or what the DFA cannot take.
+            var probe = regex.Regex.compile(gpa, g.out.items, .{ .dialect = dialect, .engine = .dfa }, null) catch continue;
+            probe.deinit(gpa);
+            for (0..8) |_| {
+                var hay: [14]u8 = undefined;
+                const len = r.uintLessThan(usize, hay.len + 1);
+                for (hay[0..len]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+                try expectSameEngines(g.out.items, .{ .dialect = dialect }, .dfa, .pike, true, hay[0..len]);
+                compared += 1;
+            }
+        }
+    }
+    try std.testing.expect(compared > 8000);
+}
+
+test "differential: utf8 patterns agree between the DFA and the Pike VM" {
+    const patterns = [_][]const u8{ ".", ".+", "[^a]+", "é+", "(?i)é+", "[à-ü]+", "☺|é", "(?i)straße|k+", "a.c", "^é", "é$", "(é|a)*b" };
+    const hays = [_][]const u8{ "", "abc é☺ Éa", "日本語 text", "\xff\x80é\xc3", "KkK\u{212A} ſs", "😀x😀", "é\n", "a\nb" };
+    for (patterns) |pat| {
+        for (hays) |h| try expectSameEngines(pat, .{ .utf8 = true }, .dfa, .pike, true, h);
+    }
+    if (!unicode.enabled) return;
+    const uni = [_][]const u8{ "\\p{L}+", "\\p{Lu}\\p{Ll}*", "[^\\p{L}]+", "\\d+", "\\w+@\\w+" };
+    for (uni) |pat| {
+        for (hays) |h| try expectSameEngines(pat, .{ .utf8 = true }, .dfa, .pike, true, h);
+    }
+    // A Unicode \b cannot be evaluated by the DFA, so it is not eligible.
+    try expectCompileError("\\b\\w+", .{ .utf8 = true, .engine = .dfa }, error.Unsupported);
+}
+
+test "the DFA falls back when its cache is too small" {
+    // Many distinct states with a tiny cache: the answer must still be right.
+    const hay = try repeated("abcabcabd", 2000);
+    defer gpa.free(hay);
+    const opts: regex.Options = .{ .engine = .dfa, .limits = .{ .max_dfa_cache = 2000 } };
+    var re = try regex.Regex.compile(gpa, "(a|b|c)*abd(a|b|c|d){5}x", opts, null);
+    defer re.deinit(gpa);
+    var s = try re.searcher(gpa);
+    defer s.deinit();
+    try std.testing.expect((try s.find(hay, 0)) == null);
+    try std.testing.expect(!(try s.isMatch(hay)));
+    const hay2 = try std.mem.concat(gpa, u8, &.{ hay, "abdabcdax" });
+    defer gpa.free(hay2);
+    try std.testing.expect(try s.isMatch(hay2));
+    const m = (try s.find(hay2, 0)).?;
+    try std.testing.expectEqual(hay2.len, m.end());
+}
+
+test "the DFA treats a final newline like the other engines" {
+    for ([_][]const u8{ "a$", "a\\Z", "^a$", "(a)$" }) |pat| {
+        for ([_][]const u8{ "a", "a\n", "ba\n", "a\nb", "\n", "" }) |h| {
+            try expectSameEngines(pat, .{}, .dfa, .pike, true, h);
+            try expectSameEngines(pat, .{}, .dfa, .backtrack, true, h);
+        }
+    }
+}
+
+test "word boundaries in the DFA (ASCII)" {
+    for ([_][]const u8{ "\\bfoo\\b", "\\Bo+\\B", "\\b", "\\B", "(\\w+)\\b" }) |pat| {
+        for ([_][]const u8{ "foo", "a foo b", "xfoox", "foo_bar foo", "", " ", "fooo" }) |h| {
+            try expectSameEngines(pat, .{}, .dfa, .pike, true, h);
+        }
     }
 }

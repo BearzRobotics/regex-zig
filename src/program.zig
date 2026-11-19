@@ -5,6 +5,7 @@ const ast = @import("ast.zig");
 const parse = @import("parse.zig");
 const ByteSet = @import("byteset.zig").ByteSet;
 const utf8 = @import("utf8.zig");
+const unicode = @import("unicode.zig");
 
 pub const unset = std.math.maxInt(usize);
 
@@ -49,6 +50,9 @@ pub const Engine = enum {
     auto,
     backtrack,
     pike,
+    /// Lazy DFA for the match span, Pike VM for captures. Only patterns whose
+    /// assertions a DFA can evaluate qualify (see dfaEligible).
+    dfa,
 };
 
 /// What the compiler needs beyond the AST.
@@ -85,12 +89,20 @@ pub const Program = struct {
     /// Matching is over UTF-8: start positions inside a character are skipped.
     utf8: bool,
     longest: bool,
-    /// The engine `find` uses: .backtrack or .pike, never .auto.
+    /// The engine `find` uses: .backtrack, .pike or .dfa, never .auto.
     engine: Engine,
     nfa: ?Nfa,
+    /// The same pattern compiled right to left, for the DFA that finds where
+    /// a match starts. Set exactly when engine is .dfa.
+    reverse_nfa: ?Nfa,
+    /// The pattern contains `$` or `\Z`, which match before a final newline.
+    /// The DFA treats them as end of text, so a haystack that ends in a
+    /// newline is searched with the Pike VM instead.
+    final_newline_assertion: bool,
 
     pub fn deinit(prog: Program, gpa: std.mem.Allocator) void {
         if (prog.nfa) |n| n.deinit(gpa);
+        if (prog.reverse_nfa) |n| n.deinit(gpa);
         gpa.free(prog.insts);
         gpa.free(prog.sets);
         for (prog.cp_sets) |s| gpa.free(s);
@@ -114,6 +126,8 @@ const Compiler = struct {
     utf8: bool,
     /// Compile for the Pike VM (see Nfa) instead of the backtracker.
     nfa: bool = false,
+    /// Compile the pattern right to left (the DFA that finds match starts).
+    reverse: bool = false,
     depth: u32 = 0,
     diag: *parse.Diagnostic,
 
@@ -153,7 +167,13 @@ const Compiler = struct {
                 try c.sets.append(c.gpa, s);
                 _ = try c.emit(.{ .set = @intCast(c.sets.items.len - 1) });
             },
-            .concat => |items| for (items) |it| try c.compile(it),
+            .concat => |items| if (c.reverse) {
+                var i = items.len;
+                while (i > 0) {
+                    i -= 1;
+                    try c.compile(items[i]);
+                }
+            } else for (items) |it| try c.compile(it),
             .alt => |alts| try c.compileAlt(alts, null),
             .repeat => |r| try c.compileRepeat(r),
             .group => |g| {
@@ -170,7 +190,7 @@ const Compiler = struct {
                 _ = try c.emit(.atomic_end);
             },
             .look => |l| try c.compileLook(l),
-            .assertion => |a| _ = try c.emit(.{ .assertion = a }),
+            .assertion => |a| _ = try c.emit(.{ .assertion = if (c.reverse) reverseAssertion(a) else a }),
             .backref => |b| if (c.nfa) {
                 return c.unsupported("back-reference needs the backtracking engine");
             } else {
@@ -252,6 +272,8 @@ const Compiler = struct {
             _ = try c.emit(.{ .set = @intCast(c.sets.items.len - 1) });
             return;
         }
+        // Read right to left, the last byte of a character comes first.
+        if (c.reverse) for (seqs.items) |*s| std.mem.reverse(utf8.ByteRange, s.ranges[0..s.len]);
         std.mem.sort(utf8.Sequence, seqs.items, {}, sequenceLessThan);
         var ends: std.ArrayList(u32) = .empty;
         defer ends.deinit(c.gpa);
@@ -260,8 +282,10 @@ const Compiler = struct {
     }
 
     /// `seqs` is sorted and every member has the same first `depth` ranges.
-    /// UTF-8 sequences with equal first ranges have equal length, so no
-    /// sequence is a prefix of another.
+    /// Left to right, sequences with equal first ranges have equal length.
+    /// Right to left they need not (a 2-byte and a 3-byte character can end in
+    /// the same continuation range), so a group can contain sequences that
+    /// end here as well as sequences that go on.
     fn emitTrie(c: *Compiler, seqs: []const utf8.Sequence, depth: u3, ends: *std.ArrayList(u32)) parse.Error!void {
         var i: usize = 0;
         while (i < seqs.len) {
@@ -273,10 +297,19 @@ const Compiler = struct {
             if (!last) split = try c.emit(.{ .split = .{ .first = 0, .second = 0 } });
             const body = c.here();
             try c.emitByteRange(key);
-            if (seqs[i].len == depth + 1) {
+            // Sorted shorter-first, so the ones that end here come first.
+            var ending: usize = 0;
+            while (i + ending < j and seqs[i + ending].len == depth + 1) ending += 1;
+            const continuing = seqs[i + ending .. j];
+            if (ending > 0 and continuing.len > 0) {
+                const alt = try c.emit(.{ .split = .{ .first = 0, .second = 0 } });
+                try ends.append(c.gpa, try c.emit(.{ .jmp = 0 }));
+                c.insts.items[alt] = .{ .split = .{ .first = alt + 1, .second = c.here() } };
+                try c.emitTrie(continuing, depth + 1, ends);
+            } else if (ending > 0) {
                 try ends.append(c.gpa, try c.emit(.{ .jmp = 0 }));
             } else {
-                try c.emitTrie(seqs[i..j], depth + 1, ends);
+                try c.emitTrie(continuing, depth + 1, ends);
             }
             if (!last) c.insts.items[split] = .{ .split = .{ .first = body, .second = c.here() } };
             i = j;
@@ -419,6 +452,58 @@ const Compiler = struct {
             .{ .first = loop + 1, .second = exit } };
     }
 };
+
+/// The assertion that holds at the same position when the text is read
+/// right to left. `$` and `\Z` become start-of-text; the DFA only runs when
+/// they mean end of text (see Program.final_newline_assertion).
+fn reverseAssertion(a: ast.Assertion) ast.Assertion {
+    return switch (a) {
+        .line_start => .line_end,
+        .line_end => .line_start,
+        .text_start => .text_end,
+        .text_end, .text_end_or_final_newline => .text_start,
+        .word_boundary, .not_word_boundary, .search_start => a,
+    };
+}
+
+/// Whether the lazy DFA can run this pattern: no `\G`, and `\b` only when it
+/// is ASCII-only (a Unicode `\b` needs the characters around the position,
+/// not just the previous byte).
+fn dfaEligible(n: *const ast.Node, unicode_word: bool) bool {
+    return switch (n.*) {
+        .assertion => |a| switch (a) {
+            .search_start => false,
+            .word_boundary, .not_word_boundary => !unicode_word,
+            else => true,
+        },
+        .empty, .byte, .any, .set, .cp_set, .atomic, .look, .backref => true,
+        .concat => |items| for (items) |it| {
+            if (!dfaEligible(it, unicode_word)) break false;
+        } else true,
+        .alt => |alts| for (alts) |a| {
+            if (!dfaEligible(a, unicode_word)) break false;
+        } else true,
+        .repeat => |r| dfaEligible(r.sub, unicode_word),
+        .group => |g| dfaEligible(g.sub, unicode_word),
+    };
+}
+
+fn hasFinalNewlineAssertion(n: *const ast.Node) bool {
+    return switch (n.*) {
+        .assertion => |a| a == .text_end_or_final_newline,
+        .empty, .byte, .any, .set, .cp_set, .backref => false,
+        .concat => |items| for (items) |it| {
+            if (hasFinalNewlineAssertion(it)) break true;
+        } else false,
+        .alt => |alts| for (alts) |a| {
+            if (hasFinalNewlineAssertion(a)) break true;
+        } else false,
+        .repeat => |r| hasFinalNewlineAssertion(r.sub),
+        .group => |g| hasFinalNewlineAssertion(g.sub),
+        .atomic => |sub| hasFinalNewlineAssertion(sub),
+        .look => |l| hasFinalNewlineAssertion(l.sub),
+    };
+}
 
 fn sequenceLessThan(_: void, a: utf8.Sequence, b: utf8.Sequence) bool {
     const n = @min(a.len, b.len);
@@ -574,8 +659,8 @@ const Built = struct {
 
 /// One compilation of the AST: for the backtracker (`nfa` false) or for the
 /// Pike VM. The caller owns the returned slices.
-fn build(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limits, utf8_mode: bool, nfa: bool, diag: *parse.Diagnostic) parse.Error!Built {
-    var c: Compiler = .{ .gpa = gpa, .limits = limits, .group_count = parsed.group_count, .utf8 = utf8_mode, .nfa = nfa, .diag = diag };
+fn build(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limits, utf8_mode: bool, nfa: bool, reverse: bool, diag: *parse.Diagnostic) parse.Error!Built {
+    var c: Compiler = .{ .gpa = gpa, .limits = limits, .group_count = parsed.group_count, .utf8 = utf8_mode, .nfa = nfa, .reverse = reverse, .diag = diag };
     errdefer c.insts.deinit(gpa);
     errdefer c.sets.deinit(gpa);
     errdefer {
@@ -603,12 +688,12 @@ fn build(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limits, utf
 /// and `settings.engine` is not `.backtrack`.
 pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limits, settings: Settings, diag: *parse.Diagnostic) parse.Error!Program {
     const eligible = !needsBacktracker(parsed.root);
-    if (settings.engine == .pike and !eligible) {
+    if ((settings.engine == .pike or settings.engine == .dfa) and !eligible) {
         diag.* = .{ .pos = 0, .message = "pattern needs the backtracking engine (back-reference, look-around, atomic group or possessive quantifier)" };
         return error.Unsupported;
     }
 
-    const bt = try build(gpa, parsed, limits, settings.utf8, false, diag);
+    const bt = try build(gpa, parsed, limits, settings.utf8, false, false, diag);
     errdefer {
         gpa.free(bt.insts);
         gpa.free(bt.sets);
@@ -619,16 +704,36 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
     var nfa: ?Nfa = null;
     errdefer if (nfa) |n| n.deinit(gpa);
     if (eligible and settings.engine != .backtrack) {
-        if (build(gpa, parsed, limits, settings.utf8, true, diag)) |b| {
+        if (build(gpa, parsed, limits, settings.utf8, true, false, diag)) |b| {
             nfa = .{ .insts = b.insts, .sets = b.sets };
             gpa.free(b.cp_sets);
         } else |e| switch (e) {
             // Too big for the Pike VM: fall back to the backtracker, unless
             // the caller insisted.
-            error.LimitExceeded => if (settings.engine == .pike) return e else {
+            error.LimitExceeded => if (settings.engine == .pike or settings.engine == .dfa) return e else {
                 diag.* = .{};
             },
             else => return e,
+        }
+    }
+
+    // The lazy DFA needs the pattern compiled right to left as well.
+    var reverse_nfa: ?Nfa = null;
+    errdefer if (reverse_nfa) |n| n.deinit(gpa);
+    if (nfa != null and (settings.engine == .auto or settings.engine == .dfa)) {
+        if (dfaEligible(parsed.root, settings.utf8 and unicode.enabled)) {
+            if (build(gpa, parsed, limits, settings.utf8, true, true, diag)) |b| {
+                reverse_nfa = .{ .insts = b.insts, .sets = b.sets };
+                gpa.free(b.cp_sets);
+            } else |e| switch (e) {
+                error.LimitExceeded => if (settings.engine == .dfa) return e else {
+                    diag.* = .{};
+                },
+                else => return e,
+            }
+        } else if (settings.engine == .dfa) {
+            diag.* = .{ .pos = 0, .message = "pattern uses an assertion the DFA cannot evaluate (\\G, or \\b with Unicode word characters)" };
+            return error.Unsupported;
         }
     }
 
@@ -654,7 +759,9 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
         .names = names,
         .utf8 = settings.utf8,
         .longest = settings.longest,
-        .engine = if (nfa != null) .pike else .backtrack,
+        .engine = if (reverse_nfa != null) .dfa else if (nfa != null) .pike else .backtrack,
         .nfa = nfa,
+        .reverse_nfa = reverse_nfa,
+        .final_newline_assertion = hasFinalNewlineAssertion(parsed.root),
     };
 }
