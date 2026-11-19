@@ -129,6 +129,21 @@ fn split(gpa: std.mem.Allocator, out: *std.ArrayList(Sequence), lo: u21, hi: u21
     try out.append(gpa, s);
 }
 
+/// Binary search in a normalized range list.
+pub fn containsRange(ranges: []const CpRange, cp: u21) bool {
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (cp < ranges[mid].lo) {
+            hi = mid;
+        } else if (cp > ranges[mid].hi) {
+            lo = mid + 1;
+        } else return true;
+    }
+    return false;
+}
+
 /// The UTF-8 lead bytes that can begin an encoding of a scalar in `r`.
 pub fn leadByteRange(r: CpRange) ByteRange {
     var a: [4]u8 = undefined;

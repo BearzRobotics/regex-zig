@@ -1,6 +1,6 @@
 # 0001: UTF-8 matching
 
-Status: **Accepted** (decisions in §8). Phase 1 is implemented; §9 records what was measured.
+Status: **Accepted** (decisions in §8). Phase 1 (§9) and phase 2 (§10) are implemented.
 
 Related: SPEC.md §2 goal 4 ("match over bytes by default and over UTF-8 when requested") and §6 (`utf8` option).
 
@@ -121,3 +121,27 @@ These are small against `max_program_len` (100,000), so the gate passes and §3.
 **Testing.** `utf8.zig` checks the range splitting against `std.unicode` for every scalar value (about 1.1 million) on several range shapes, requires that no two sequences accept the same encoding, and checks ill-formed forms (overlong, surrogate, above U+10FFFF, truncated, stray continuation). `tests.zig` covers the parser, search and iteration behaviour, and invalid haystacks.
 
 **Behaviour choices to be aware of.** In `utf8` mode `\xHH` is the scalar U+00HH (so `\xE9` is `é`, two bytes). A stray continuation byte is never a match start. `\W`, `\D`, `\S` and negated POSIX classes include all non-ASCII characters until phase 2.
+
+## 10. Phase 2 results
+
+Implemented: `\p{..}` / `\P{..}` / `\pL` / `\p{^..}`, Unicode-aware `\w \d \s \b`, and Unicode meanings for the POSIX classes alpha, alnum, upper, lower, digit, space, word and blank, all in `utf8` mode only.
+
+**Tables (decision 8.4).** `tools/gen_unicode.py` generates `src/unicode_tables.zig` from the Unicode Character Database **18.0.0**. The header of the generated file records the version and the SHA-256 of every input file, and the script documents how to regenerate it. Only the Python standard library is needed, and only by maintainers. The checked-in file is about 225 KB of source: General_Category (all values and the groups L, LC, M, N, P, S, Z, C), Script (all scripts), Alphabetic, Lowercase, Uppercase, White_Space, Any, ASCII, Assigned, and the derived `\w` set. Names are matched loosely (UAX #44 LM3). The binary-size cost of linking the tables was not measured.
+
+Verification done while generating: the General_Category tables partition the 1,112,064 scalar values exactly (no gaps or overlaps), and they agree with Python's `unicodedata` (Unicode 16.0) on every character assigned in 16.0 except U+0295, which the UCD 18.0.0 data lists as `Lo`, so the generator follows the source file.
+
+**New VM instruction (a change to §3.1).** A large set cannot be lowered to byte sequences without hundreds of alternatives per character: `\p{L}` would be tried against all of them one after another, in a backtracking VM that also spends a step per attempt. So a set that needs more than 16 byte sequences compiles to one `cp_class` instruction instead. It decodes one well-formed UTF-8 character (invalid, truncated, overlong, surrogate and out-of-range sequences all fail) and binary-searches the range list. Smaller sets, including `.` and `[^a]`, still lower to byte sequences. This is the §3.2 approach used only where §3.1 does not scale. Consequences:
+
+- Program size for `\p{L}+` is 12 instructions plus one shared range list (identical sets are shared when a repeat body is compiled several times).
+- A future lazy DFA must lower `cp_class` to byte automata itself. It can reuse `utf8.appendSequences`, so no work is lost.
+- The step budget counts one step per character for these classes. A test matches `\p{L}+` over 300,000 bytes of mixed text.
+
+**`\b`.** The word-boundary assertion decodes the character before and after the position when it is not ASCII; an invalid or truncated neighbour is not a word character, and a position inside a character is never reported as a boundary.
+
+**Behaviour choices.**
+- An unknown property name is `InvalidPattern`; `\p{..}` without `utf8` is `Unsupported`.
+- `\p{Name}` is tried as a binary property, then General_Category, then Script, as Rust's regex does; `gc=`, `sc=` and the long forms are accepted. Script_Extensions is not supported.
+- `\w` follows UTS #18 Annex C: Alphabetic + Mark + Decimal_Number + Connector_Punctuation + Join_Control.
+- `punct`, `cntrl`, `print`, `graph`, `xdigit` and `ascii` stay ASCII, because their Unicode definitions vary between engines.
+
+**Not done (phase 3).** Unicode case folding. `(?i)` still folds ASCII only.

@@ -416,7 +416,8 @@ test "utf8: dot and classes consume whole characters" {
     try expectU8("[é]", "caf\u{e9}", .{ 3, 5 });
     try expectU8("[à-ü]+", "xéüy", .{ 1, 5 });
     try expectU8("[^à-ü]", "éa", .{ 2, 3 });
-    try expectU8("^\\W$", "é", .{ 0, 2 }); // \w is ASCII-only for now
+    try expectU8("^\\W$", "☺", .{ 0, 3 });
+    try expectU8("^\\W$", "é", null); // \w is Unicode-aware in utf8 mode
     try expectU8("^\\D$", "☺", .{ 0, 3 });
     // The same patterns keep their byte meaning without utf8.
     try expectSpan("^.$", "é", null);
@@ -510,4 +511,132 @@ test "utf8: program size for . and [^a]" {
         defer re.deinit(gpa);
         try std.testing.expect(re.prog.insts.len < 80);
     }
+}
+
+// ---- utf8 mode: Unicode properties and classes (phase 2) ---------------------
+
+test "utf8: \\w \\d \\s are Unicode-aware" {
+    try expectU8("^\\w+$", "café_9", .{ 0, 7 });
+    try expectU8("^\\w+$", "漢字", .{ 0, 6 });
+    try expectU8("^\\w$", "\u{300}", .{ 0, 2 }); // combining mark
+    try expectU8("^\\d+$", "٣٤٥", .{ 0, 6 }); // Arabic-Indic digits
+    try expectU8("^\\D$", "٣", null);
+    try expectU8("^\\s+$", " \u{a0}\u{3000}", .{ 0, 6 });
+    try expectU8("^\\S$", "\u{a0}", null);
+    try expectU8("^\\W$", "-", .{ 0, 1 });
+    // Byte mode keeps ASCII semantics.
+    try expectSpan("^\\w$", "é", null);
+}
+
+test "utf8: \\p and \\P" {
+    try expectU8("^\\p{L}+$", "héllo", .{ 0, 6 });
+    try expectU8("^\\pL+$", "héllo", .{ 0, 6 });
+    try expectU8("\\p{Lu}", "aÉb", .{ 1, 3 });
+    try expectU8("\\p{Ll}", "AÉb", .{ 3, 4 });
+    try expectU8("^\\p{Greek}+$", "αβγ", .{ 0, 6 });
+    try expectU8("\\p{Script=Han}+", "a漢字b", .{ 1, 7 });
+    try expectU8("\\p{sc=Hira}+", "xひらy", .{ 1, 7 });
+    try expectU8("\\p{gc=Nd}", "a٣", .{ 1, 3 });
+    try expectU8("\\p{Alphabetic}+", "1ab2", .{ 1, 3 });
+    try expectU8("^\\P{L}+$", "12 -", .{ 0, 4 });
+    try expectU8("\\P{L}", "é", null);
+    try expectU8("\\p{^L}", "é", null);
+    try expectU8("\\P{^L}", "é", .{ 0, 2 });
+    try expectU8("^\\p{Any}$", "😀", .{ 0, 4 });
+    try expectU8("\\p{letter}", "x", .{ 0, 1 }); // loose names
+    // Inside classes, alone and combined.
+    try expectU8("^[\\p{L}\\d_]+$", "été_٣", .{ 0, 8 });
+    try expectU8("^[^\\p{L}]+$", "12!", .{ 0, 3 });
+    try expectU8("[^\\p{L}]", "é", null);
+    try expectU8("^[\\P{L}]$", "é", null);
+    try expectU8("^[\\p{Lu}\\p{Nd}]+$", "É٣A", .{ 0, 5 });
+}
+
+test "utf8: \\p errors" {
+    try expectCompileError("\\p{NoSuchThing}", u8opts, error.InvalidPattern);
+    try expectCompileError("\\p{L", u8opts, error.InvalidPattern);
+    try expectCompileError("\\p", u8opts, error.InvalidPattern);
+    try expectCompileError("\\p{gc=Greek}", u8opts, error.InvalidPattern);
+    try expectCompileError("\\p{L}", .{}, error.Unsupported); // needs utf8
+    try expectCompileError("[\\p{L}]", .{}, error.Unsupported);
+}
+
+test "utf8: POSIX classes use Unicode where it is clear" {
+    try expectU8("^[[:alpha:]]+$", "héllo", .{ 0, 6 });
+    try expectU8("^[[:upper:]]$", "É", .{ 0, 2 });
+    try expectU8("^[[:lower:]]$", "é", .{ 0, 2 });
+    try expectU8("^[[:alnum:]]+$", "é٣a", .{ 0, 5 });
+    try expectU8("^[[:digit:]]$", "٣", .{ 0, 2 });
+    try expectU8("^[[:space:]]$", "\u{3000}", .{ 0, 3 });
+    try expectU8("^[[:blank:]]+$", " \t\u{a0}", .{ 0, 4 });
+    try expectU8("^[[:^alpha:]]$", "é", null);
+    try expectU8("^[[:punct:]]$", "!", .{ 0, 1 });
+    try expectU8("^[[:punct:]]$", "¿", null); // punct stays ASCII
+    try expectSpan("^[[:alpha:]]$", "é", null); // byte mode unchanged
+}
+
+test "utf8: \\b is Unicode-aware" {
+    try withSearcher("\\bcafé\\b", u8opts, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            try std.testing.expect(try s.isMatch("un café noir"));
+            try std.testing.expect(!(try s.isMatch("cafés")));
+            try std.testing.expect(!(try s.isMatch("xcafé")));
+        }
+    }.f);
+    try withSearcher("\\b", u8opts, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            // "é a": boundaries at 0, 2, 3, 4. Not between the bytes of é.
+            try std.testing.expectEqual(@as(usize, 4), try s.count("é a"));
+            // Invalid bytes are not word characters.
+            try std.testing.expectEqual(@as(usize, 2), try s.count("a\xff"));
+        }
+    }.f);
+    try withSearcher("\\B", u8opts, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            try std.testing.expect(!(try s.isMatch("é")));
+        }
+    }.f);
+    // Byte mode: the two bytes of é are not word bytes, so 'é' alone has no boundary.
+    try withSearcher("\\b", .{}, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            try std.testing.expectEqual(@as(usize, 0), try s.count("é"));
+        }
+    }.f);
+}
+
+test "utf8: large classes stay small and run in one step per character" {
+    var re = try regex.Regex.compile(gpa, "\\p{L}+", u8opts, null);
+    defer re.deinit(gpa);
+    // The set is far too big to lower to byte sequences; it uses cp_class.
+    try std.testing.expect(re.prog.insts.len < 20);
+    try std.testing.expect(re.prog.cp_sets.len == 1);
+    var s = try re.searcher(gpa);
+    defer s.deinit();
+    // 100k characters: with one alternative per sequence this would exceed
+    // the step budget; with cp_class it is linear.
+    const text = try repeated("é漢a", 100_000);
+    defer gpa.free(text);
+    const m = (try s.find(text, 0)).?;
+    try std.testing.expectEqual(@as(usize, text.len), m.end());
+}
+
+test "utf8: invalid bytes never match a property class" {
+    const bad = [_][]const u8{ "\xff", "\x80", "\xc3", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xe2\x82" };
+    for (bad) |h| {
+        try expectU8("^\\p{L}$", h, null);
+        try expectU8("^\\P{L}$", h, null);
+        try expectU8("^\\w$", h, null);
+        try expectU8("^\\W$", h, null);
+        try expectU8("^[^\\p{L}]$", h, null);
+    }
+}
+
+test "utf8: Unicode classes on captures and replacement" {
+    try withSearcher("(\\p{Lu})(\\p{Ll}+)", u8opts, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            const out = try s.replaceAll(gpa, "Émile et Zoé", "$2$1");
+            defer gpa.free(out);
+            try std.testing.expectEqualStrings("mileÉ et oéZ", out);
+        }
+    }.f);
 }

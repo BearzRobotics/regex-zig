@@ -32,16 +32,18 @@ conditionals, recursion, callouts.
 
 ## Known gaps and deviations
 
-- Byte matching by default: `.` consumes one byte. With `Options.utf8` the pattern
-  must be valid UTF-8 and `.`, classes, negation and `\x{...}` work on Unicode
-  scalar values. Still byte/ASCII-only in `utf8` mode: `\w \d \s \b` and the
-  POSIX classes (so `\W` matches any non-ASCII character), case folding, and
-  `\p{..}`. Look-behind must have a fixed width in bytes (`(?<=.)` is rejected).
-  A match never starts inside a character; invalid UTF-8 in the haystack never
-  matches `.` or a class.
-- Case-insensitive matching is ASCII only.
-- Nested quantifiers such as `(a+)+b` are exponential in a backtracker; the
-  step budget turns this into `StepLimitExceeded`.
+- Byte matching by default: `.` consumes one byte, and `\p{..}` is rejected. With
+  `Options.utf8` the pattern must be valid UTF-8 and matching is over Unicode
+  scalar values: `.`, classes, negation, `\x{...}`, `\p{..}` / `\P{..}`
+  (General_Category, Script, Alphabetic, Lowercase, Uppercase, White_Space, Any,
+  ASCII, Assigned; Unicode 18.0.0), `\w \d \s \b` (UTS #18 Annex C definitions)
+  and the POSIX classes alpha, alnum, upper, lower, digit, space, word and blank.
+  Still ASCII-only in `utf8` mode: punct, cntrl, print, graph, xdigit, ascii and
+  `\h`; case-insensitive matching folds ASCII only (so `(?i)é` does not match
+  `É`, and `(?i)\p{Lu}` is not widened); `\p{Script_Extensions=..}` and other
+  properties are rejected. Look-behind must have a fixed width in bytes
+  (`(?<=.)` is rejected). A match never starts inside a character; invalid UTF-8
+  in the haystack never matches `.` or a class and is not a word character.
 - Each `split` pushes a stack frame, so `.*` over an N-byte line needs N
   frames (default cap 4M). Single-byte-loop specialisation is planned.
 - Back-reference to a group that did not participate fails (Oniguruma and

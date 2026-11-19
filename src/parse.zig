@@ -18,13 +18,15 @@
 //! and `.` and negated classes consume one byte. With `utf8` set the pattern
 //! must be valid UTF-8 and literals, `.`, classes, negation and `\x{...}`
 //! work on Unicode scalar values (docs/decisions/0001-utf8-matching.md).
-//! Unicode properties (\p{..}) are reported as unsupported rather than
-//! ignored (SPEC §5).
+//! In that mode \p{..}, \w, \d, \s and the common POSIX classes use the
+//! Unicode tables; \p{..} without `utf8` is reported as unsupported rather
+//! than ignored (SPEC §5).
 
 const std = @import("std");
 const ast = @import("ast.zig");
 const ByteSet = @import("byteset.zig").ByteSet;
 const ucp = @import("utf8.zig");
+const unicode = @import("unicode.zig");
 
 const Node = ast.Node;
 
@@ -199,6 +201,41 @@ const Parser = struct {
     fn classFromSet(p: *Parser, s: ByteSet, negate: bool) Error!Class {
         var cls: Class = .{ .bytes = s };
         if (negate) try p.classInvert(&cls);
+        return cls;
+    }
+
+    /// Adds every scalar value in `table`, or every one outside it.
+    fn classAddTable(p: *Parser, cls: *Class, table: unicode.Table, negate: bool) Error!void {
+        var list: std.ArrayList(ucp.CpRange) = .empty;
+        try unicode.appendRanges(p.arena, &list, table);
+        if (negate) try ucp.complementFrom(p.arena, &list, 0);
+        for (list.items) |r| try p.classAddRange(cls, r.lo, r.hi);
+    }
+
+    /// `\p{Name}`, `\pL`, `\p{^Name}` and the `\P` forms; the cursor is just
+    /// past the `p` or `P`.
+    fn propertyClass(p: *Parser, negated: bool, at: usize) Error!Class {
+        if (!p.utf8) return p.fail(error.Unsupported, at, "Unicode property \\p{...} needs utf8 mode");
+        var neg = negated;
+        var name: []const u8 = undefined;
+        if (p.eat('{')) {
+            const close = std.mem.indexOfScalarPos(u8, p.src, p.pos, '}') orelse
+                return p.fail(error.InvalidPattern, at, "unterminated \\p{...}");
+            name = p.src[p.pos..close];
+            p.pos = close + 1;
+            if (name.len > 0 and name[0] == '^') {
+                neg = !neg;
+                name = name[1..];
+            }
+        } else {
+            if (p.pos >= p.src.len) return p.fail(error.InvalidPattern, at, "\\p needs a property name");
+            name = p.src[p.pos..][0..1];
+            p.pos += 1;
+        }
+        const table = unicode.lookupProperty(name) orelse
+            return p.fail(error.InvalidPattern, at, "unknown or unsupported Unicode property");
+        var cls: Class = .{};
+        try p.classAddTable(&cls, table, neg);
         return cls;
     }
 
@@ -545,6 +582,20 @@ const Parser = struct {
     /// The class for \d \w \s \h and their negations, or null for any other letter.
     fn classEscape(p: *Parser, c: u8) Error!?Class {
         var s: ByteSet = .{};
+        if (p.utf8) {
+            // Unicode-aware in utf8 mode (UTS #18, Annex C).
+            const table: ?unicode.Table = switch (std.ascii.toLower(c)) {
+                'd' => unicode.digit,
+                'w' => unicode.word,
+                's' => unicode.space,
+                else => null,
+            };
+            if (table) |tbl| {
+                var cls: Class = .{};
+                try p.classAddTable(&cls, tbl, std.ascii.isUpper(c));
+                return cls;
+            }
+        }
         switch (std.ascii.toLower(c)) {
             'd' => s.addRange('0', '9'),
             'w' => {
@@ -649,7 +700,10 @@ const Parser = struct {
             'z' => return try p.node(.{ .assertion = .text_end }),
             'Z' => return try p.node(.{ .assertion = .text_end_or_final_newline }),
             'G' => return try p.node(.{ .assertion = .search_start }),
-            'p', 'P' => return p.fail(error.Unsupported, at, "Unicode property \\p{...}"),
+            'p', 'P' => {
+                var cls = try p.propertyClass(c == 'P', at);
+                return try p.classNode(&cls);
+            },
             'R', 'X', 'K', 'C' => return p.fail(error.Unsupported, at, "unsupported escape"),
             'E' => return null,
             'k' => {
@@ -791,9 +845,40 @@ const Parser = struct {
             return null;
         }
         if (e == 'b') return 0x08; // \b inside a class is backspace
-        if (e == 'p' or e == 'P') return p.fail(error.Unsupported, at, "Unicode property \\p{...}");
+        if (e == 'p' or e == 'P') {
+            try p.classUnion(cls, try p.propertyClass(e == 'P', at));
+            return null;
+        }
         if (try p.byteEscape(e, at)) |cp| return cp;
         return p.fail(error.InvalidPattern, at, "unknown escape sequence in class");
+    }
+
+    /// In utf8 mode the classes with a clear Unicode meaning (UTS #18,
+    /// Annex C) use the tables; the rest (punct, cntrl, print, graph, xdigit,
+    /// ascii) stay ASCII. Null means "not one of those".
+    fn posixUnicodeClass(p: *Parser, name: []const u8, neg: bool) Error!?Class {
+        var cls: Class = .{};
+        if (std.mem.eql(u8, name, "alpha")) {
+            try p.classAddTable(&cls, unicode.alphabetic, false);
+        } else if (std.mem.eql(u8, name, "alnum")) {
+            try p.classAddTable(&cls, unicode.alphabetic, false);
+            try p.classAddTable(&cls, unicode.digit, false);
+        } else if (std.mem.eql(u8, name, "upper")) {
+            try p.classAddTable(&cls, unicode.uppercase, false);
+        } else if (std.mem.eql(u8, name, "lower")) {
+            try p.classAddTable(&cls, unicode.lowercase, false);
+        } else if (std.mem.eql(u8, name, "digit")) {
+            try p.classAddTable(&cls, unicode.digit, false);
+        } else if (std.mem.eql(u8, name, "space")) {
+            try p.classAddTable(&cls, unicode.space, false);
+        } else if (std.mem.eql(u8, name, "word")) {
+            try p.classAddTable(&cls, unicode.word, false);
+        } else if (std.mem.eql(u8, name, "blank")) {
+            try p.classAddTable(&cls, unicode.space_separator, false);
+            try p.classAddCp(&cls, '\t');
+        } else return null;
+        if (neg) try p.classInvert(&cls);
+        return cls;
     }
 
     /// At "[:". Returns the set for [:name:] / [:^name:], or null (cursor
@@ -805,6 +890,10 @@ const Parser = struct {
         var name = p.src[start + 2 .. end];
         const neg = name.len > 0 and name[0] == '^';
         if (neg) name = name[1..];
+        if (p.utf8) if (try p.posixUnicodeClass(name, neg)) |cls| {
+            p.pos = end + 2;
+            return cls;
+        };
         var s: ByteSet = .{};
         if (std.mem.eql(u8, name, "alpha")) {
             s.addRange('a', 'z');

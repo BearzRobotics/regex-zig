@@ -8,11 +8,18 @@ const utf8 = @import("utf8.zig");
 
 pub const unset = std.math.maxInt(usize);
 
+/// A set that needs more byte sequences than this is matched with `cp_class`
+/// instead (see ADR 0001, section 10).
+const max_inline_sequences = 16;
+
 pub const Inst = union(enum) {
     byte: u8,
     any, // any byte except '\n'
     any_nl, // any byte
     set: u32, // index into Program.sets
+    /// utf8 mode: decode one scalar value and test it against Program.cp_sets[n].
+    /// Used for sets too large to be worth lowering to byte sequences.
+    cp_class: u32,
     /// Try `first`; on failure resume at `second`.
     split: struct { first: u32, second: u32 },
     jmp: u32,
@@ -43,6 +50,7 @@ pub const Program = struct {
     /// positions without running the VM.
     first_bytes: ?ByteSet,
     sets: []const ByteSet,
+    cp_sets: []const []const utf8.CpRange,
     group_count: u32,
     reg_count: u32,
     names: []const parse.Name,
@@ -52,6 +60,8 @@ pub const Program = struct {
     pub fn deinit(prog: Program, gpa: std.mem.Allocator) void {
         gpa.free(prog.insts);
         gpa.free(prog.sets);
+        for (prog.cp_sets) |s| gpa.free(s);
+        gpa.free(prog.cp_sets);
         for (prog.names) |n| gpa.free(n.name);
         gpa.free(prog.names);
     }
@@ -62,6 +72,10 @@ const Compiler = struct {
     limits: parse.Limits,
     insts: std.ArrayList(Inst) = .empty,
     sets: std.ArrayList(ByteSet) = .empty,
+    cp_sets: std.ArrayList([]const utf8.CpRange) = .empty,
+    /// The AST slice each entry of cp_sets was copied from, so a node that is
+    /// compiled several times (a repeat body) shares one copy.
+    cp_sources: std.ArrayList([]const utf8.CpRange) = .empty,
     loop_slots: u32 = 0,
     group_count: u32,
     utf8: bool,
@@ -145,6 +159,23 @@ const Compiler = struct {
         var seqs: std.ArrayList(utf8.Sequence) = .empty;
         defer seqs.deinit(c.gpa);
         for (ranges) |r| try utf8.appendSequences(c.gpa, &seqs, r);
+        if (seqs.items.len > max_inline_sequences) {
+            // Trying hundreds of alternatives per character would be slow;
+            // decode the character once and binary-search the ranges instead.
+            for (c.cp_sources.items, 0..) |src, k| {
+                if (src.ptr == ranges.ptr and src.len == ranges.len) {
+                    _ = try c.emit(.{ .cp_class = @intCast(k) });
+                    return;
+                }
+            }
+            const copy = try c.gpa.dupe(utf8.CpRange, ranges);
+            errdefer c.gpa.free(copy);
+            try c.cp_sources.ensureUnusedCapacity(c.gpa, 1);
+            try c.cp_sets.append(c.gpa, copy);
+            c.cp_sources.appendAssumeCapacity(ranges);
+            _ = try c.emit(.{ .cp_class = @intCast(c.cp_sets.items.len - 1) });
+            return;
+        }
         if (seqs.items.len == 0) {
             // An empty set never matches.
             try c.sets.append(c.gpa, .{});
@@ -396,6 +427,11 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
     var c: Compiler = .{ .gpa = gpa, .limits = limits, .group_count = parsed.group_count, .utf8 = utf8_mode, .diag = diag };
     errdefer c.insts.deinit(gpa);
     errdefer c.sets.deinit(gpa);
+    errdefer {
+        for (c.cp_sets.items) |s| gpa.free(s);
+        c.cp_sets.deinit(gpa);
+        c.cp_sources.deinit(gpa);
+    }
 
     _ = try c.emit(.{ .save = 0 }); // match start; also anchors \G-free scanning
     try c.compile(parsed.root);
@@ -416,11 +452,15 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
     const insts = try c.insts.toOwnedSlice(gpa);
     errdefer gpa.free(insts);
     const sets = try c.sets.toOwnedSlice(gpa);
+    errdefer gpa.free(sets);
+    const cp_sets = try c.cp_sets.toOwnedSlice(gpa);
+    c.cp_sources.deinit(gpa);
     const first = firstOf(parsed.root);
     return .{
         .insts = insts,
         .first_bytes = if (first.nullable) null else first.set,
         .sets = sets,
+        .cp_sets = cp_sets,
         .group_count = parsed.group_count,
         .reg_count = 2 * (parsed.group_count + 1) + c.loop_slots,
         .names = names,
