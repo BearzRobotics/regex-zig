@@ -320,3 +320,79 @@ test "posix_ere dialect" {
     // Case folding applies as in the other dialects.
     try expectSpanOpts("COPY", "a copy", .{ 2, 6 }, .{ .dialect = .posix_ere, .ignore_case = true });
 }
+
+fn withSearcher(pattern: []const u8, opts: regex.Options, comptime body: fn (*regex.Searcher) anyerror!void) !void {
+    var re = try regex.Regex.compile(gpa, pattern, opts, null);
+    defer re.deinit(gpa);
+    var s = try re.searcher(gpa);
+    defer s.deinit();
+    try body(&s);
+}
+
+test "isMatch and count" {
+    try withSearcher("a+", .{}, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            try std.testing.expect(try s.isMatch("xxaxx"));
+            try std.testing.expect(!(try s.isMatch("xxx")));
+            try std.testing.expectEqual(@as(usize, 3), try s.count("a-aa-aaa"));
+        }
+    }.f);
+}
+
+test "iteration over empty matches terminates and covers every position" {
+    try withSearcher("x*", .{}, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            // "abc": empty matches at 0,1,2,3.
+            try std.testing.expectEqual(@as(usize, 4), try s.count("abc"));
+            // "axxb": empty@0, "xx"@1..3, empty@3, empty@4.
+            const spans = try s.findAll(gpa, "axxb");
+            defer gpa.free(spans);
+            try std.testing.expectEqual(@as(usize, 4), spans.len);
+            try std.testing.expectEqual(@as(usize, 1), spans[1].start);
+            try std.testing.expectEqual(@as(usize, 3), spans[1].end);
+            try std.testing.expectEqual(@as(usize, 0), try s.count("") - 1);
+        }
+    }.f);
+}
+
+test "split" {
+    try withSearcher(",", .{}, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            const parts = try s.split(gpa, "a,b,,c,");
+            defer gpa.free(parts);
+            try std.testing.expectEqual(@as(usize, 5), parts.len);
+            try std.testing.expectEqualStrings("a", parts[0]);
+            try std.testing.expectEqualStrings("", parts[2]);
+            try std.testing.expectEqualStrings("", parts[4]);
+        }
+    }.f);
+}
+
+test "replaceAll expands numbered and named groups" {
+    try withSearcher("(?<k>\\w+)=(\\w+)", .{}, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            const out = try s.replaceAll(gpa, "a=1, bb=2", "${2}:$1 ($$) ${k}");
+            defer gpa.free(out);
+            try std.testing.expectEqualStrings("1:a ($) a, 2:bb ($) bb", out);
+        }
+    }.f);
+}
+
+test "replaceAll rejects bad templates even without matches" {
+    try withSearcher("(a)", .{}, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            for ([_][]const u8{ "$", "$x", "$2", "${nope}", "${1", "${}" }) |bad|
+                try std.testing.expectError(error.InvalidReplacement, s.replaceAll(gpa, "zzz", bad));
+        }
+    }.f);
+}
+
+test "non-participating group expands to nothing" {
+    try withSearcher("(a)|(b)", .{}, struct {
+        fn f(s: *regex.Searcher) anyerror!void {
+            const out = try s.replaceAll(gpa, "ab", "[$1|$2]");
+            defer gpa.free(out);
+            try std.testing.expectEqualStrings("[a|][|b]", out);
+        }
+    }.f);
+}

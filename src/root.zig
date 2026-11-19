@@ -1,13 +1,15 @@
 //! regex-zig: a pure-Zig regular-expression library (see SPEC.md).
 //!
 //! Current state: the Perl, Oniguruma and POSIX ERE parsers and the bounded
-//! backtracking engine. POSIX BRE, the Rust dialect, the linear-time engine,
+//! backtracking engine, with isMatch/matches/count/findAll/split/replaceAll
+//! helpers on Searcher (ops.zig). POSIX BRE, the Rust dialect, the linear-time engine,
 //! UTF-8 and streaming are not implemented yet.
 
 const std = @import("std");
 const parse = @import("parse.zig");
 const program = @import("program.zig");
 const backtrack = @import("backtrack.zig");
+const ops = @import("ops.zig");
 
 pub const Dialect = parse.Dialect;
 pub const Limits = parse.Limits;
@@ -16,6 +18,9 @@ pub const Diagnostic = parse.Diagnostic;
 pub const MatchError = backtrack.MatchError;
 pub const Match = backtrack.Match;
 pub const Searcher = backtrack.Searcher;
+pub const Span = ops.Span;
+pub const Matches = ops.Matches;
+pub const ReplaceError = ops.ReplaceError;
 
 pub const Options = struct {
     dialect: Dialect = .perl,

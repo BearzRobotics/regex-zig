@@ -7,6 +7,7 @@ const std = @import("std");
 const program = @import("program.zig");
 const parse = @import("parse.zig");
 const ByteSet = @import("byteset.zig").ByteSet;
+const ops = @import("ops.zig");
 
 const Program = program.Program;
 const unset = program.unset;
@@ -62,6 +63,13 @@ pub const Searcher = struct {
     steps: u64 = 0,
     /// Position recorded by the marker most recently removed by cutToMarker.
     cut_pos: usize = 0,
+
+    pub const isMatch = ops.isMatch;
+    pub const matches = ops.matches;
+    pub const count = ops.count;
+    pub const findAll = ops.findAll;
+    pub const split = ops.split;
+    pub const replaceAll = ops.replaceAll;
 
     pub fn init(gpa: std.mem.Allocator, prog: Program, limits: parse.Limits) !Searcher {
         return .{
