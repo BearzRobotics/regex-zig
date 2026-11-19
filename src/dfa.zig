@@ -57,6 +57,8 @@ pub const Dfa = struct {
     uses_prev: bool,
     /// Bytes a match can start with (forward DFA, pattern cannot match empty).
     first: ?ByteSet,
+    /// Bytes every match starts with (forward DFA), or empty.
+    prefix: []const u8,
     nclasses: usize,
     stride: usize,
     classes: [256]u8 = undefined,
@@ -86,7 +88,7 @@ pub const Dfa = struct {
     visited_len: usize = 0,
     matched: bool = false,
 
-    pub fn init(gpa: std.mem.Allocator, nfa: program.Nfa, anchored: bool, utf8: bool, first: ?ByteSet, max_bytes: usize) Error!Dfa {
+    pub fn init(gpa: std.mem.Allocator, nfa: program.Nfa, anchored: bool, utf8: bool, first: ?ByteSet, prefix: []const u8, max_bytes: usize) Error!Dfa {
         const n = nfa.insts.len;
         const dense = try gpa.alloc(u32, n);
         errdefer gpa.free(dense);
@@ -105,6 +107,7 @@ pub const Dfa = struct {
             .utf8 = utf8,
             .uses_prev = false,
             .first = if (anchored) null else first,
+            .prefix = if (anchored) &.{} else prefix,
             .nclasses = 0,
             .stride = 0,
             .arena = std.heap.ArenaAllocator.init(gpa),
@@ -434,7 +437,9 @@ pub const Dfa = struct {
             if (d.first) |fb| if (d.isIdle(state)) {
                 // Nothing is running: jump to the next byte a match can start with.
                 var q = pos;
-                if (fb.count() == 1) {
+                if (d.prefix.len >= 2) {
+                    q = std.mem.indexOfPos(u8, hay, pos, d.prefix) orelse hay.len;
+                } else if (fb.count() == 1) {
                     const only: u8 = for (0..256) |i| {
                         if (fb.has(@intCast(i))) break @intCast(i);
                     } else unreachable;

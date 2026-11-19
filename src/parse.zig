@@ -74,6 +74,8 @@ pub const Error = error{
 pub const Diagnostic = struct {
     pos: usize = 0,
     message: []const u8 = "",
+    /// For a set of patterns: which one the problem is in.
+    pattern: usize = 0,
 };
 
 pub const Name = struct { name: []const u8, index: u32 };
@@ -1258,4 +1260,60 @@ pub fn parse(
     if (p.max_backref > p.group_count)
         return p.fail(error.InvalidPattern, p.backref_pos, "reference to a group that does not exist");
     return .{ .root = root, .group_count = p.group_count, .names = p.names.items };
+}
+
+/// A copy of `n` with every capture group made a plain group, or an error for
+/// a back-reference (which would point at a group that no longer exists).
+fn stripCaptures(arena: std.mem.Allocator, n: *const Node) Error!*const Node {
+    const out = try arena.create(Node);
+    out.* = switch (n.*) {
+        .empty, .byte, .any, .set, .cp_set, .assertion => n.*,
+        .backref => return error.Unsupported,
+        .concat => |items| .{ .concat = try stripAll(arena, items) },
+        .alt => |items| .{ .alt = try stripAll(arena, items) },
+        .repeat => |r| .{ .repeat = .{ .sub = try stripCaptures(arena, r.sub), .min = r.min, .max = r.max, .greed = r.greed } },
+        .group => |g| .{ .group = .{ .sub = try stripCaptures(arena, g.sub), .index = null } },
+        .atomic => |sub| .{ .atomic = try stripCaptures(arena, sub) },
+        .look => |l| .{ .look = .{ .sub = try stripCaptures(arena, l.sub), .ahead = l.ahead, .negate = l.negate } },
+    };
+    return out;
+}
+
+fn stripAll(arena: std.mem.Allocator, items: []const *const Node) Error![]const *const Node {
+    const out = try arena.alloc(*const Node, items.len);
+    for (items, out) |it, *o| o.* = try stripCaptures(arena, it);
+    return out;
+}
+
+/// Parses several patterns into one alternation, in order, for a set. Capture
+/// groups are dropped (a set reports spans, not groups) and back-references
+/// are rejected. On failure `diag.pattern` says which pattern.
+pub fn parseSet(
+    arena: std.mem.Allocator,
+    patterns: []const []const u8,
+    dialect: Dialect,
+    ignore_case: bool,
+    utf8: bool,
+    limits: Limits,
+    diag: *Diagnostic,
+) Error!Parsed {
+    var alts: std.ArrayList(*const Node) = .empty;
+    for (patterns, 0..) |pat, i| {
+        const one = parse(arena, pat, dialect, ignore_case, utf8, limits, diag) catch |e| {
+            diag.pattern = i;
+            return e;
+        };
+        const stripped = stripCaptures(arena, one.root) catch |e| {
+            diag.* = .{ .pos = 0, .message = "back-references are not supported in a set", .pattern = i };
+            return e;
+        };
+        try alts.append(arena, stripped);
+    }
+    const root = try arena.create(Node);
+    root.* = switch (alts.items.len) {
+        0 => .{ .set = .{} }, // an empty set never matches
+        1 => alts.items[0].*,
+        else => .{ .alt = alts.items },
+    };
+    return .{ .root = root, .group_count = 0, .names = &.{} };
 }

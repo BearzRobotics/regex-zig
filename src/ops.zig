@@ -140,3 +140,41 @@ pub fn replaceAll(s: *Searcher, gpa: std.mem.Allocator, hay: []const u8, repl: [
     try out.appendSlice(gpa, hay[last..]);
     return out.toOwnedSlice(gpa);
 }
+
+/// One line of the input, without its newline.
+pub const Line = struct {
+    /// 1-based.
+    number: usize,
+    /// Offset of the first byte of the line in the input.
+    start: usize,
+    text: []const u8,
+};
+
+/// Iterates over the lines of `hay` that match, or with `invert` that do not
+/// (`grep` and `grep -v`). Each line is matched on its own: `^` and `$` are
+/// the ends of the line and a match never spans lines. A final line with no
+/// newline counts; an empty piece after the last newline does not.
+pub const MatchingLines = struct {
+    searcher: *Searcher,
+    hay: []const u8,
+    invert: bool = false,
+    pos: usize = 0,
+    number: usize = 0,
+
+    pub fn next(it: *MatchingLines) MatchError!?Line {
+        while (it.pos < it.hay.len) {
+            const start = it.pos;
+            const nl = std.mem.indexOfScalarPos(u8, it.hay, start, '\n') orelse it.hay.len;
+            it.pos = nl + 1;
+            it.number += 1;
+            const text = it.hay[start..nl];
+            if ((try it.searcher.matchesAnywhere(text)) != it.invert)
+                return .{ .number = it.number, .start = start, .text = text };
+        }
+        return null;
+    }
+};
+
+pub fn matchingLines(s: *Searcher, hay: []const u8, invert: bool) MatchingLines {
+    return .{ .searcher = s, .hay = hay, .invert = invert };
+}

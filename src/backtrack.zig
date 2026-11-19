@@ -83,6 +83,7 @@ pub const Searcher = struct {
     pub const count = ops.count;
     pub const findAll = ops.findAll;
     pub const split = ops.split;
+    pub const matchingLines = ops.matchingLines;
     pub const replaceAll = ops.replaceAll;
 
     pub fn init(gpa: std.mem.Allocator, prog: Program, limits: parse.Limits) !Searcher {
@@ -97,9 +98,9 @@ pub const Searcher = struct {
         var fwd: ?dfa.Dfa = null;
         var rev: ?dfa.Dfa = null;
         if (prog.engine == .dfa) {
-            fwd = try dfa.Dfa.init(gpa, prog.nfa.?, false, prog.utf8, prog.first_bytes, limits.max_dfa_cache);
+            fwd = try dfa.Dfa.init(gpa, prog.nfa.?, false, prog.utf8, prog.first_bytes, prog.literal_prefix, limits.max_dfa_cache);
             errdefer if (fwd) |*f| f.deinit();
-            rev = try dfa.Dfa.init(gpa, prog.reverse_nfa.?, true, prog.utf8, null, limits.max_dfa_cache);
+            rev = try dfa.Dfa.init(gpa, prog.reverse_nfa.?, true, prog.utf8, null, &.{}, limits.max_dfa_cache);
         }
         return .{ .gpa = gpa, .prog = prog, .limits = limits, .regs = regs, .best = best, .pike = vm, .fwd = fwd, .rev = rev };
     }

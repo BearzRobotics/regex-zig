@@ -95,6 +95,9 @@ pub const Program = struct {
     /// The same pattern compiled right to left, for the DFA that finds where
     /// a match starts. Set exactly when engine is .dfa.
     reverse_nfa: ?Nfa,
+    /// Bytes every match starts with (a case-sensitive literal prefix), or
+    /// empty. Lets the DFA jump to the next occurrence with a substring search.
+    literal_prefix: []const u8,
     /// The pattern contains `$` or `\Z`, which match before a final newline.
     /// The DFA treats them as end of text, so a haystack that ends in a
     /// newline is searched with the Pike VM instead.
@@ -103,6 +106,7 @@ pub const Program = struct {
     pub fn deinit(prog: Program, gpa: std.mem.Allocator) void {
         if (prog.nfa) |n| n.deinit(gpa);
         if (prog.reverse_nfa) |n| n.deinit(gpa);
+        gpa.free(prog.literal_prefix);
         gpa.free(prog.insts);
         gpa.free(prog.sets);
         for (prog.cp_sets) |s| gpa.free(s);
@@ -490,6 +494,24 @@ fn dfaEligible(n: *const ast.Node, unicode_word: bool) bool {
     };
 }
 
+/// Appends the literal bytes the pattern must start with. Returns true when
+/// the whole of `n` is literal, so the next item in a sequence can extend it.
+fn collectPrefix(n: *const ast.Node, out: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool {
+    switch (n.*) {
+        .empty => return true,
+        .byte => |b| {
+            try out.append(gpa, b);
+            return true;
+        },
+        .concat => |items| {
+            for (items) |it| if (!try collectPrefix(it, out, gpa)) return false;
+            return true;
+        },
+        .group => |g| return collectPrefix(g.sub, out, gpa),
+        else => return false,
+    }
+}
+
 fn hasFinalNewlineAssertion(n: *const ast.Node) bool {
     return switch (n.*) {
         .assertion => |a| a == .text_end_or_final_newline,
@@ -750,6 +772,14 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
         done = i + 1;
     }
 
+    var prefix: std.ArrayList(u8) = .empty;
+    errdefer prefix.deinit(gpa);
+    _ = try collectPrefix(parsed.root, &prefix, gpa);
+    // A single byte is already covered by the first-byte set.
+    if (prefix.items.len < 2) prefix.clearRetainingCapacity();
+    const literal_prefix = try prefix.toOwnedSlice(gpa);
+    errdefer gpa.free(literal_prefix);
+
     const first = firstOf(parsed.root);
     return .{
         .insts = bt.insts,
@@ -764,6 +794,7 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
         .engine = if (reverse_nfa != null) .dfa else if (nfa != null) .pike else .backtrack,
         .nfa = nfa,
         .reverse_nfa = reverse_nfa,
+        .literal_prefix = literal_prefix,
         .final_newline_assertion = hasFinalNewlineAssertion(parsed.root),
     };
 }

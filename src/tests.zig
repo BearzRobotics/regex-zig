@@ -1272,3 +1272,115 @@ test "rust: \\u escapes and Unicode" {
     try expectSpanOpts("(?i)É", "é", .{ 0, 2 }, rust8);
     try expectSpanOpts("[\\p{Greek}&&\\p{Ll}]+", "ΑΒαβγΓ", .{ 4, 10 }, rust8);
 }
+
+// ---- sets, literal prefixes, lines ------------------------------------------------
+
+test "regex set: any member matches, earlier patterns win ties" {
+    var set = try regex.RegexSet.compile(gpa, &.{ "foo", "ba+r", "x[0-9]" }, .{}, null);
+    defer set.deinit(gpa);
+    var s = try set.searcher(gpa);
+    defer s.deinit();
+    try std.testing.expect(try s.isMatch("a baaar b"));
+    try std.testing.expect(try s.isMatch("zzx7"));
+    try std.testing.expect(!(try s.isMatch("fo ba x")));
+    const m = (try s.find("--bar--foo", 0)).?;
+    try std.testing.expectEqual(@as(usize, 2), m.start());
+    try std.testing.expectEqual(@as(usize, 5), m.end());
+
+    const which = try set.matchedPatterns(gpa, "foo and x1");
+    defer gpa.free(which);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, which);
+    try std.testing.expectEqual(@as(usize, 3), set.len());
+}
+
+test "regex set: leftmost-first picks the earlier pattern, POSIX the longest" {
+    var perl = try regex.RegexSet.compile(gpa, &.{ "ab", "abc" }, .{}, null);
+    defer perl.deinit(gpa);
+    var ps = try perl.searcher(gpa);
+    defer ps.deinit();
+    try std.testing.expectEqual(@as(usize, 2), (try ps.find("abc", 0)).?.end());
+
+    var ere = try regex.RegexSet.compile(gpa, &.{ "ab", "abc" }, .{ .dialect = .posix_ere }, null);
+    defer ere.deinit(gpa);
+    var es = try ere.searcher(gpa);
+    defer es.deinit();
+    try std.testing.expectEqual(@as(usize, 3), (try es.find("abc", 0)).?.end());
+}
+
+test "regex set: empty set, errors, groups and back-references" {
+    var none = try regex.RegexSet.compile(gpa, &.{}, .{}, null);
+    defer none.deinit(gpa);
+    var ns = try none.searcher(gpa);
+    defer ns.deinit();
+    try std.testing.expect(!(try ns.isMatch("anything")));
+
+    var diag: regex.Diagnostic = .{};
+    try std.testing.expectError(error.InvalidPattern, regex.RegexSet.compile(gpa, &.{ "ok", "(bad" }, .{}, &diag));
+    try std.testing.expectEqual(@as(usize, 1), diag.pattern);
+    try std.testing.expectError(error.Unsupported, regex.RegexSet.compile(gpa, &.{ "a", "(b)\\1" }, .{}, &diag));
+    try std.testing.expectEqual(@as(usize, 1), diag.pattern);
+
+    // Groups are accepted and simply not reported.
+    var grouped = try regex.RegexSet.compile(gpa, &.{ "(a)(b)", "c(d)" }, .{}, null);
+    defer grouped.deinit(gpa);
+    var gs = try grouped.searcher(gpa);
+    defer gs.deinit();
+    try std.testing.expect(try gs.isMatch("xcd"));
+    try std.testing.expectEqual(@as(u32, 0), grouped.all.groupCount());
+}
+
+test "regex set: many patterns agree with one alternation" {
+    const pats = [_][]const u8{ "alpha", "be+ta", "gam{2}a", "d[a-c]lta", "^eps", "zeta$" };
+    var set = try regex.RegexSet.compile(gpa, &pats, .{}, null);
+    defer set.deinit(gpa);
+    var one = try regex.Regex.compile(gpa, "alpha|be+ta|gam{2}a|d[a-c]lta|^eps|zeta$", .{}, null);
+    defer one.deinit(gpa);
+    var ss = try set.searcher(gpa);
+    defer ss.deinit();
+    var os = try one.searcher(gpa);
+    defer os.deinit();
+    for ([_][]const u8{ "alpha", "xbeeeta", "gammma", "gamma", "delta dbltaa", "epsilon", "an eps", "zeta", "zeta ", "" }) |h| {
+        const a = try ss.find(h, 0);
+        const b = try os.find(h, 0);
+        try std.testing.expectEqual(b == null, a == null);
+        if (a) |m| {
+            try std.testing.expectEqual(b.?.start(), m.start());
+            try std.testing.expectEqual(b.?.end(), m.end());
+        }
+    }
+}
+
+test "literal prefix: found by substring search, results unchanged" {
+    var re = try regex.Regex.compile(gpa, "needle[0-9]+x", .{}, null);
+    defer re.deinit(gpa);
+    try std.testing.expectEqualStrings("needle", re.prog.literal_prefix);
+    var s = try re.searcher(gpa);
+    defer s.deinit();
+    const filler = try repeated("needl needle needle9 neeedle ", 1000);
+    defer gpa.free(filler);
+    const hay = try std.mem.concat(gpa, u8, &.{ filler, "needle123x!" });
+    defer gpa.free(hay);
+    const m = (try s.find(hay, 0)).?;
+    try std.testing.expectEqual(filler.len, m.start());
+    try std.testing.expectEqual(hay.len - 1, m.end());
+    try std.testing.expect((try s.find(filler, 0)) == null);
+    // Group, case-insensitive and non-literal starts have no usable prefix.
+    var g = try regex.Regex.compile(gpa, "(ab)cd", .{}, null);
+    defer g.deinit(gpa);
+    try std.testing.expectEqualStrings("abcd", g.prog.literal_prefix);
+    var ci = try regex.Regex.compile(gpa, "(?i)abc", .{}, null);
+    defer ci.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), ci.prog.literal_prefix.len);
+    var alt = try regex.Regex.compile(gpa, "ab|cd", .{}, null);
+    defer alt.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), alt.prog.literal_prefix.len);
+}
+
+test "literal prefix with a prefix at the end of the haystack and overlapping starts" {
+    for ([_][]const u8{ "aab", "aaab", "abab" }) |pat| {
+        for ([_][]const u8{ "aaaab", "aa", "ababab", "xaab", "a", "", "aaabaab" }) |h| {
+            try expectSameEngines(pat, .{}, .dfa, .pike, true, h);
+            try expectSameEngines(pat, .{}, .dfa, .backtrack, true, h);
+        }
+    }
+}
