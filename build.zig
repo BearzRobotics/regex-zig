@@ -26,6 +26,25 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("build_options", options);
 
+    // Benchmarks are always built with ReleaseFast so numbers are meaningful.
+    const bench_regex = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_regex.addOptions("build_options", options);
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "regex", .module = bench_regex }},
+        }),
+    });
+    const bench_step = b.step("bench", "Run benchmarks (ReleaseFast)");
+    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+
     const test_step = b.step("test", "Run Zig unit tests");
     const unit = b.addTest(.{ .root_module = mod });
     test_step.dependOn(&b.addRunArtifact(unit).step);

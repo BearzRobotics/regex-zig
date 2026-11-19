@@ -728,3 +728,41 @@ test "utf8: without the tables case folding is ASCII-only" {
     try expectU8i("é", "É", null);
     try expectU8i("k", "\u{212A}", null);
 }
+
+// ---- pathological patterns -----------------------------------------------------
+
+// BASELINE for the backtracking engine only. SPEC section 2 goal 2 requires
+// linear time for patterns without back-references or look-around: once the
+// linear-time engine exists these must return "no match" quickly, and these
+// expectations must be replaced (not loosened).
+test "pathological patterns: backtracker stops at the step limit" {
+    const cases = [_]struct { pattern: []const u8, unit: u8, n: usize, tail: []const u8 }{
+        .{ .pattern = "(a*)*b", .unit = 'a', .n = 30, .tail = "" },
+        .{ .pattern = "(a+)+$", .unit = 'a', .n = 30, .tail = "!" },
+        .{ .pattern = "(a|aa)+$", .unit = 'a', .n = 40, .tail = "!" },
+        .{ .pattern = "(x+x+)+y", .unit = 'x', .n = 40, .tail = "" },
+    };
+    for (cases) |c| {
+        const body = try gpa.alloc(u8, c.n);
+        defer gpa.free(body);
+        @memset(body, c.unit);
+        const hay = try std.mem.concat(gpa, u8, &.{ body, c.tail });
+        defer gpa.free(hay);
+        var re = try regex.Regex.compile(gpa, c.pattern, .{}, null);
+        defer re.deinit(gpa);
+        var s = try re.searcher(gpa);
+        defer s.deinit();
+        try std.testing.expectError(error.StepLimitExceeded, s.find(hay, 0));
+    }
+}
+
+test "step budget is per find call, so a long scan can exceed it" {
+    // BASELINE: documents a weakness the linear-time engine removes.
+    const hay = try repeated("the quick brown fox ", 100_000);
+    defer gpa.free(hay);
+    var re = try regex.Regex.compile(gpa, "[a-z]+@", .{}, null);
+    defer re.deinit(gpa);
+    var s = try re.searcher(gpa);
+    defer s.deinit();
+    try std.testing.expectError(error.StepLimitExceeded, s.find(hay, 0));
+}
