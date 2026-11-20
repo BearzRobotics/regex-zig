@@ -46,6 +46,10 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
 
     const test_step = b.step("test", "Run Zig unit tests");
-    const unit = b.addTest(.{ .root_module = mod });
+    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this");
+    const unit = b.addTest(.{
+        .root_module = mod,
+        .filters = if (test_filter) |f| b.dupeStrings(&.{f}) else &.{},
+    });
     test_step.dependOn(&b.addRunArtifact(unit).step);
 }

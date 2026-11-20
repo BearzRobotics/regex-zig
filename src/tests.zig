@@ -1520,13 +1520,16 @@ test "allocation failure: compile and search clean up and never crash" {
         .{ .pat = "x\\{2,3\\}\\(y\\)", .opts = .{ .dialect = .posix_bre } },
         .{ .pat = "[a-z&&[^aeiou]]+", .opts = .{ .dialect = .rust } },
     };
-    for (patterns) |c| {
+    patterns: for (patterns) |c| {
         var fail_at: usize = 0;
         while (true) : (fail_at += 1) {
             var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
             const a = fa.allocator();
             var re = regex.Regex.compile(a, c.pat, c.opts, null) catch |e| {
-                try std.testing.expect(e == error.OutOfMemory or e == error.Unsupported);
+                // Unsupported never depends on allocation (for example \p{..}
+                // with -Dunicode_tables=false), so retrying would not end.
+                if (e == error.Unsupported) continue :patterns;
+                try std.testing.expect(e == error.OutOfMemory);
                 continue;
             };
             defer re.deinit(a);

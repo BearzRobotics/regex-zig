@@ -109,3 +109,22 @@ A first usable release exists when:
 - A reproducible contributor workflow (`zig build`, `zig build test`) exists and is documented.
 
 References to consult during implementation: POSIX Base Definitions, Regular Expressions; GNU grep manual; GNU sed manual; Rust `regex` crate documentation and its syntax reference; RE2 syntax and design write-ups; the Unicode Standard Annex #29 and Technical Standard #18 for Unicode matching. This draft does not claim any of these were consulted or verified.
+
+## 11. Implementation status (non-normative, added with 0.3.0)
+
+This section records progress against the sections above without changing them.
+
+| Goal / criterion | Status |
+|---|---|
+| §2.1 POSIX BRE and ERE with GNU extensions; Rust-style; Perl subset | Implemented: `Dialect.posix_bre`, `.posix_ere`, `.rust`, `.perl`, `.oniguruma`. ERE and BRE agree with GNU grep 3.12 on 1,400 generated patterns, one known deviation (`docs/compatibility/posix_ere.md`). `[[.ch.]]` and `[[=e=]]` are not supported (a stated non-goal). |
+| §2.2 Linear time without back-references or look-around | Done: lazy DFA and Pike VM (`docs/decisions/0002-matching-engines.md`); pathological-pattern tests. Exception: a pattern too large for the NFA program falls back to the backtracker. |
+| §2.3 Back-references and look-around on a bounded path | Done: backtracker with step and stack limits. |
+| §2.4 Bytes by default, UTF-8 on request | Done (`docs/decisions/0001-utf8-matching.md`). |
+| §2.5 Streaming `std.Io.Reader` and slices | Slices: done. Readers: line-oriented only (`LineStream`); see decision 6 in `docs/decisions/0003-resolved-open-decisions.md`. |
+| §2.6 Fast paths | First-byte and literal-prefix skipping with `std.mem` searches; no SIMD code of our own, no required-substring prefilter, no Aho-Corasick or Teddy. |
+| §2.7 Native Zig API | Done; names differ from the §6 sketch (`Options.dialect`, `ignore_case`, `utf8`). |
+| §2.8 Spans, captures, sets, line search, modes, substitution | Done: `find`, `Match.group`, `RegexSet`, `matchingLines`, `replaceAll`, flags. |
+| §5 Leftmost-longest for POSIX syntaxes | Done for the overall match; sub-group positions follow thread priority, not the POSIX subexpression rule. |
+| §7 Testing | Unit, differential (engines against each other; GNU grep 3.12), fuzz, allocation-failure and pathological-pattern tests, benchmarks. No differential test against ripgrep or the Rust crate. Tests live in `src/` (`src/tests.zig`, `src/testdata/`) because `@embedFile` cannot reach outside the module directory. |
+| §8 Documentation | `docs/architecture.md`, `docs/decisions/` (0001 to 0003), `docs/compatibility/` for every dialect. |
+| §10 Acceptance | BRE and ERE: met. Linear time: met. Contributor workflow: met (`README.md`). Core Utils `grep` on this library: not part of this repository's work; the API it needs (`RegexSet`, `matchingLines`, `LineStream`, `isMatch`) exists. |

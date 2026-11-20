@@ -27,6 +27,8 @@ const Case = struct {
 const no_step_limit: regex.Limits = .{ .max_steps = std.math.maxInt(u64) };
 
 const throughput_cases = [_]Case{
+    .{ .name = "literal prefix + class", .pattern = "needle[0-9]+", .kind = .prose, .size = 4 << 20, .options = .{ .limits = no_step_limit } },
+    .{ .name = "ERE alternation (longest)", .pattern = "quick|lazy|brown|fox", .kind = .prose, .size = 4 << 20, .options = .{ .dialect = .posix_ere, .limits = no_step_limit } },
     .{ .name = "literal, absent", .pattern = "zqxjv", .kind = .prose, .size = 4 << 20, .options = .{ .limits = no_step_limit } },
     .{ .name = "literal, many", .pattern = "the", .kind = .prose, .size = 4 << 20, .options = .{ .limits = no_step_limit } },
     .{ .name = "alternation of words", .pattern = "quick|lazy|brown|fox", .kind = .prose, .size = 4 << 20, .options = .{ .limits = no_step_limit } },

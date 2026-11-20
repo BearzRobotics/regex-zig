@@ -38,3 +38,9 @@ First consumer: dkman (`apropos` / `whatis` patterns).
 - `.posix_ere` is **leftmost-longest** for the overall match: the leftmost start wins, then the longest end (`a|ab` on `abc` matches `ab`). Sub-group positions follow thread priority among matches of the same length, which is not the POSIX subexpression rule.
 - Patterns without back-references run on the Pike VM in time linear in the input; patterns with back-references run on the backtracker (still leftmost-longest, bounded by the step limit). See `docs/decisions/0002-matching-engines.md`.
 - `Options.utf8` works with this dialect: `.`, bracket expressions and negation use Unicode scalar values; `\w`, `\s` and the POSIX classes alpha, alnum, upper, lower, digit, space and blank are Unicode-aware; `(?i)` equivalents use simple case folding. See `perl.md` for the full list.
+
+## Changes in 0.3.0
+
+- `\<` and `\>` (word start and end), `` \` `` and `\'` (start and end of the text) are supported, as in GNU.
+- `$` is the end of the text, no longer "before a final newline".
+- Agreement with GNU grep 3.12 `-E` is tested on 700 generated patterns (`src/testdata/grep_cases.txt`, LC_ALL=C). One known difference: for a back-reference to a group that is repeated and can match empty, such as `b|((c?)){2}\1$`, GNU grep selects no line where regex-zig follows Perl semantics and does. The test lists it as a known deviation.

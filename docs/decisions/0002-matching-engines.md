@@ -1,6 +1,6 @@
 # 0002: Matching engines
 
-Status: **Accepted** (the order of work was approved in the roadmap discussion). Step A (Pike VM and engine selection) is described in section 6 as it is implemented.
+Status: **Accepted**. Steps A (Pike VM and engine selection, section 6) and B (lazy DFA, section 9) are implemented.
 
 Related: SPEC.md §2 goals 2 and 3, §4 (architecture), §5 (leftmost-longest for POSIX), §9 decisions 1 and 5.
 
@@ -64,6 +64,21 @@ Verification: the pathological baseline tests flip to "completes and reports no 
 - **DFA only.** Cannot produce captures, so a second engine would be needed anyway.
 - **Stepping the Pike VM by character** instead of by byte. This would let `cp_class` stay one instruction, but priorities between threads that finish at different positions become ambiguous, which breaks leftmost-first.
 
-## 8. Not decided here
 
-The lazy DFA's cache policy and assertion support (step B), and streaming (SPEC §9.6), get their own sections or ADRs when they are done.
+## 9. Step B: the lazy DFA
+
+Files: `src/dfa.zig`; `program.zig` (reverse compile, eligibility, literal prefix); `backtrack.zig` (`Searcher.findDfa`, `matchesAnywhere`).
+
+**Shape.** A DFA state is an ordered list of NFA instructions to resume at plus the kind of the previous byte (text edge, newline, word, other). Empty-width assertions are evaluated when a transition is built, from the previous byte (in the state) and the next byte (the transition's symbol), so `^ $ \b \B \< \>` need no special states. A transition returns the next state and whether a match ends at the current position, before the next byte (a match is reported one byte late, as in other lazy DFAs). Bytes are grouped into equivalence classes so a state needs one transition per class, not 256.
+
+**Two directions.** The forward, unanchored DFA is leftmost-first (a match drops lower-priority threads, including later starts) and gives the end of the leftmost-first match. The same pattern compiled right to left, anchored at that end and keeping all threads, gives the start: it is the smallest start of any match ending there, which equals the leftmost start. The Pike VM runs only to fill in captures, starting at the DFA's start. Leftmost-longest dialects use the DFA only to decide that a match exists (earliest-ending match end cannot give the leftmost start), then the Pike VM finds the span.
+
+**Eligibility.** No `\G`, and no `\b \B \< \>` when `utf8` is on with the Unicode tables (a Unicode word boundary needs the characters around the position, not one previous byte). `$` and `\Z` are evaluated as end of text, so a haystack that ends in a newline is searched with the Pike VM when the pattern contains one (checked per search).
+
+**Cache.** States and transitions are cached up to `Limits.max_dfa_cache` (2 MiB default) per direction. When full the cache is cleared; after four clears in one search the DFA gives up and that search runs on the Pike VM. Adding a state is atomic with respect to allocation failure (found by the allocation-failure test).
+
+**Prefilters.** When nothing is running and the pattern cannot match empty, the forward DFA skips to the next byte a match can start with (`memchr`-style for one byte), or, for a literal prefix of two or more bytes, to the next occurrence of the prefix with a substring search. No SIMD code of our own: this is `std.mem.indexOfScalarPos` and `indexOfPos`.
+
+**Results.** On `zig build bench` (same machine, MB/s): `[a-z]+` 21 (Pike only) to 121, email-like 15 to 232, utf8 `\p{L}+` 3 to 144, alternation of words 55 to 396, literal `the` 217 to 499. Captured groups still take the Pike VM (about 17 MB/s), and a leftmost-longest `find` too (about 47 MB/s); `isMatch` is the fast path for those.
+
+**Testing.** Randomized differential tests compare the DFA with the Pike VM (spans, groups, `isMatch`, iteration) over four syntaxes; targeted tests cover a tiny cache, final newlines, ASCII and Unicode word boundaries, prefixes, and utf8.

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+- **Lazy DFA** (forward and reverse) as the default engine for eligible patterns. It finds where a match ends and starts; the Pike VM runs only to fill in captures. This recovers, and mostly exceeds, the speed lost in 0.2.0 (`zig build bench`, MB/s, 0.2.0 to 0.3.0: `[a-z]+` 21 to 121, email-like 15 to 232, utf8 `\p{L}+` 3 to 144, alternation of words 55 to 396, literal `the` 217 to 499). Cache size is bounded by `Limits.max_dfa_cache`; when it keeps filling, the search falls back to the Pike VM. `Options.engine = .dfa` forces it.
+- **Literal-prefix and first-byte skipping** in the DFA, using `std.mem` substring searches.
+- **POSIX BRE** (`Dialect.posix_bre`) with the GNU extensions `\+ \? \|` and `\{m,n\}`, and the BRE rules for `*`, `^` and `$`. Leftmost-longest.
+- **Rust regex syntax** (`Dialect.rust`): flags `i m s x U`, set operations in classes (`&&`, `--`, `~~`), `\u` escapes; back-references, look-around and other non-regular constructs are errors.
+- **Word and text anchors** `\<`, `\>`, `` \` ``, `\'` in the POSIX dialects.
+- **`RegexSet`**: many patterns searched together (`grep -f`), with `matchedPatterns`.
+- **Line-oriented search**: `Searcher.matchingLines` over memory and `LineStream` over a `std.Io.Reader`, with invert (`grep -v`).
+- **Tests:** agreement with GNU grep 3.12 on 1,400 generated BRE and ERE patterns, DFA-vs-Pike differential tests, fuzzing with arbitrary pattern bytes, allocation-failure tests.
+- **Docs:** `docs/architecture.md`, ADR 0003 (the open decisions from SPEC section 9), compatibility pages for BRE and Rust, an implementation-status section in `SPEC.md`.
+
+### Changed
+- POSIX dialects: `$` is the end of the text, not "before a final newline".
+- `Limits` has a new field `max_dfa_cache`; `Engine` has a new value `.dfa`; `Dialect` has `.posix_bre` and `.rust`; `Diagnostic` has a `pattern` field.
+
+### Fixed
+- Found by the new tests: a lazy-DFA cache that was left inconsistent after an allocation failure, and leaks when its initialisation failed part-way.
+
+### Known limitations
+- Captured groups and leftmost-longest spans are found by the Pike VM, which is slower (about 17 and 47 MB/s on the benchmark); `isMatch` and `find` without groups use the DFA.
+- Sub-group positions can differ between engines for some quantified groups whose body can match the empty string, and in leftmost-longest mode follow thread priority, not the POSIX subexpression rule.
+- GNU grep selects no line for a back-reference to a repeated group that can match empty (`b|((c?)){2}\1$`); regex-zig follows Perl semantics there.
+- Streaming is line-oriented only. No SIMD prefilters of our own, no Aho-Corasick for large literal sets.
+- Full Unicode case folding (ß to ss) and `\p{Script_Extensions}` are not supported. In `utf8` mode look-behind needs a fixed width in bytes.
+- Not differentially tested against ripgrep or the Rust `regex` crate.
+
 ## 0.2.0
 
 ### Added
