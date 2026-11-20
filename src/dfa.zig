@@ -30,6 +30,53 @@ const Inst = program.Inst;
 
 pub const Error = error{ OutOfMemory, GaveUp };
 
+/// Substring search: 32 lanes compare the needle's first and last bytes at
+/// once, and only candidates are verified. Falls back to the standard
+/// library for short haystacks.
+fn indexOfNeedle(hay: []const u8, pos: usize, needle: []const u8) ?usize {
+    const V = 32;
+    const n = needle.len;
+    if (hay.len < pos + n) return null;
+    const last_start = hay.len - n; // last possible match start
+    const vf: @Vector(V, u8) = @splat(needle[0]);
+    const vl: @Vector(V, u8) = @splat(needle[n - 1]);
+    var i = pos;
+    while (i + V <= last_start + 1) : (i += V) {
+        const a: @Vector(V, u8) = hay[i..][0..V].*;
+        const b: @Vector(V, u8) = hay[i + n - 1 ..][0..V].*;
+        var bits: u32 = @bitCast((a == vf) & (b == vl));
+        while (bits != 0) {
+            const k = i + @ctz(bits);
+            if (std.mem.eql(u8, hay[k..][0..n], needle)) return k;
+            bits &= bits - 1;
+        }
+    }
+    while (i <= last_start) : (i += 1) {
+        if (hay[i] == needle[0] and std.mem.eql(u8, hay[i .. i + n], needle)) return i;
+    }
+    return null;
+}
+
+/// Index of the first of `a`, `b`, `c` at or after `pos`, or `hay.len`.
+fn indexOfAny3(hay: []const u8, pos: usize, a: u8, b: u8, c: u8) usize {
+    const V = 32;
+    var i = pos;
+    const va: @Vector(V, u8) = @splat(a);
+    const vb: @Vector(V, u8) = @splat(b);
+    const vc: @Vector(V, u8) = @splat(c);
+    while (i + V <= hay.len) : (i += V) {
+        const v: @Vector(V, u8) = hay[i..][0..V].*;
+        const m = (v == va) | (v == vb) | (v == vc);
+        const bits: u32 = @bitCast(m);
+        if (bits != 0) return i + @ctz(bits);
+    }
+    while (i < hay.len) : (i += 1) {
+        const x = hay[i];
+        if (x == a or x == b or x == c) return i;
+    }
+    return hay.len;
+}
+
 /// What the byte before a position was, as far as assertions care.
 pub const Kind = enum(u8) { text_edge, newline, word, other };
 
@@ -38,6 +85,8 @@ fn kindOf(b: u8) Kind {
     if (ByteSet.isWordByte(b)) return .word;
     return .other;
 }
+
+const Anchor = enum { none, line, text };
 
 const unknown: u32 = std.math.maxInt(u32);
 const max_flushes = 4;
@@ -59,6 +108,16 @@ pub const Dfa = struct {
     first: ?ByteSet,
     /// Bytes every match starts with (forward DFA), or empty.
     prefix: []const u8,
+    /// Precomputed from `first` once (see `init`): membership table, and the
+    /// members themselves when there are one to three, so the skip loop is a
+    /// memchr or a table walk instead of rescanning the 256-bit set.
+    first_tab: [256]bool = @splat(false),
+    first_n: u8 = 0,
+    first_bytes: [3]u8 = .{ 0, 0, 0 },
+    /// Where a new search can start from an idle state: `.line` when every
+    /// match begins with `^` (only just after a newline), `.text` when with
+    /// `\A`, else `.none`. Forward DFA only.
+    start_anchor: Anchor = .none,
     nclasses: usize,
     stride: usize,
     classes: [256]u8 = undefined,
@@ -69,6 +128,9 @@ pub const Dfa = struct {
     seeds: std.ArrayList([]const u32) = .empty,
     kinds: std.ArrayList(Kind) = .empty,
     nomore: std.ArrayList(bool) = .empty,
+    /// Per state: no threads, not dead, not "match already found" (the state
+    /// a search is in when nothing is running and the first-byte skip applies).
+    idle: std.ArrayList(bool) = .empty,
     trans: std.ArrayList(u32) = .empty,
     start_ids: [4]?u32 = .{ null, null, null, null },
     max_bytes: usize,
@@ -116,6 +178,19 @@ pub const Dfa = struct {
         d.seen_dense = try gpa.alloc(u32, n + 1);
         d.seen_sparse = try gpa.alloc(u32, n + 1);
         d.buildClasses();
+        if (d.first) |fb| {
+            for (0..256) |i| d.first_tab[i] = fb.has(@intCast(i));
+            const nf = fb.count();
+            if (nf <= 3) {
+                d.first_n = @intCast(nf);
+                var k: usize = 0;
+                for (0..256) |i| if (fb.has(@intCast(i))) {
+                    d.first_bytes[k] = @intCast(i);
+                    k += 1;
+                };
+            } else d.first_n = 255;
+        }
+        if (!anchored) d.start_anchor = d.findAnchor();
         d.stride = d.nclasses + 1;
         // Closures push at most one pending branch per instruction.
         try d.stack.ensureTotalCapacity(gpa, n + 2);
@@ -134,12 +209,50 @@ pub const Dfa = struct {
         d.seeds.deinit(d.gpa);
         d.kinds.deinit(d.gpa);
         d.nomore.deinit(d.gpa);
+        d.idle.deinit(d.gpa);
         d.trans.deinit(d.gpa);
         d.threads.deinit(d.gpa);
         d.stack.deinit(d.gpa);
         d.next_seeds.deinit(d.gpa);
         d.key_buf.deinit(d.gpa);
         d.arena.deinit();
+    }
+
+    /// Walks the instructions reachable from the start without consuming a
+    /// byte; the anchor holds when each path meets the same start assertion.
+    fn findAnchor(d: *Dfa) Anchor {
+        var found: Anchor = .none;
+        var stack: std.ArrayList(u32) = .empty;
+        defer stack.deinit(d.gpa);
+        var seen: std.DynamicBitSetUnmanaged = std.DynamicBitSetUnmanaged.initEmpty(d.gpa, d.insts.len) catch return .none;
+        defer seen.deinit(d.gpa);
+        stack.append(d.gpa, 0) catch return .none;
+        while (stack.pop()) |start| {
+            var pc = start;
+            while (!seen.isSet(pc)) {
+                seen.set(pc);
+                switch (d.insts[pc]) {
+                    .jmp => |t| pc = t,
+                    .split => |sp| {
+                        stack.append(d.gpa, sp.second) catch return .none;
+                        pc = sp.first;
+                    },
+                    .save => pc += 1,
+                    .assertion => |a| {
+                        const kind: Anchor = switch (a) {
+                            .line_start => .line,
+                            .text_start => .text,
+                            else => return .none,
+                        };
+                        if (found != .none and found != kind) return .none;
+                        found = kind;
+                        break;
+                    },
+                    else => return .none,
+                }
+            }
+        }
+        return found;
     }
 
     // ---- byte classes -----------------------------------------------------
@@ -229,6 +342,7 @@ pub const Dfa = struct {
         d.seeds.clearRetainingCapacity();
         d.kinds.clearRetainingCapacity();
         d.nomore.clearRetainingCapacity();
+        d.idle.clearRetainingCapacity();
         d.trans.clearRetainingCapacity();
         d.start_ids = .{ null, null, null, null };
         d.used = 0;
@@ -236,7 +350,9 @@ pub const Dfa = struct {
         try d.seeds.ensureUnusedCapacity(d.gpa, 1);
         try d.kinds.ensureUnusedCapacity(d.gpa, 1);
         try d.nomore.ensureUnusedCapacity(d.gpa, 1);
+        try d.idle.ensureUnusedCapacity(d.gpa, 1);
         try d.trans.ensureUnusedCapacity(d.gpa, d.stride);
+        d.idle.appendAssumeCapacity(false);
         d.seeds.appendAssumeCapacity(&.{});
         d.kinds.appendAssumeCapacity(.other);
         d.nomore.appendAssumeCapacity(true);
@@ -267,12 +383,14 @@ pub const Dfa = struct {
         try d.seeds.ensureUnusedCapacity(d.gpa, 1);
         try d.kinds.ensureUnusedCapacity(d.gpa, 1);
         try d.nomore.ensureUnusedCapacity(d.gpa, 1);
+        try d.idle.ensureUnusedCapacity(d.gpa, 1);
         try d.trans.ensureUnusedCapacity(d.gpa, d.stride);
         const id: u32 = @intCast(d.seeds.items.len);
         d.map.putAssumeCapacity(key, id);
         d.seeds.appendAssumeCapacity(owned);
         d.kinds.appendAssumeCapacity(kind);
         d.nomore.appendAssumeCapacity(nomore);
+        d.idle.appendAssumeCapacity(seeds.len == 0 and !nomore);
         d.trans.appendNTimesAssumeCapacity(unknown, d.stride);
         d.used += cost;
         return id;
@@ -289,7 +407,7 @@ pub const Dfa = struct {
     }
 
     fn isIdle(d: *const Dfa, id: u32) bool {
-        return d.seeds.items[id].len == 0 and !d.nomore.items[id] and id != 0;
+        return d.idle.items[id];
     }
 
     // ---- building transitions ----------------------------------------------
@@ -438,39 +556,76 @@ pub const Dfa = struct {
         var state = try d.startState(kindBefore(hay, from));
         var last: ?usize = null;
         var pos = from;
-        while (pos < hay.len) {
-            if (d.first) |fb| if (d.isIdle(state)) {
-                // Nothing is running: jump to the next byte a match can start with.
-                var q = pos;
-                if (d.prefix.len >= 2) {
-                    q = std.mem.indexOfPos(u8, hay, pos, d.prefix) orelse hay.len;
-                } else if (fb.count() == 1) {
-                    const only: u8 = for (0..256) |i| {
-                        if (fb.has(@intCast(i))) break @intCast(i);
-                    } else unreachable;
-                    q = std.mem.indexOfScalarPos(u8, hay, pos, only) orelse hay.len;
-                } else {
-                    while (q < hay.len and !fb.has(hay[q])) q += 1;
+        const has_first = d.first != null;
+        const stride = d.stride;
+        const classes = &d.classes;
+        outer: while (pos < hay.len) {
+            if (d.start_anchor != .none and pos > 0 and d.idle.items[state]) {
+                // Every match starts with ^ (or \A): nothing can start here
+                // unless the previous byte is a newline.
+                if (d.start_anchor == .text) return last;
+                if (hay[pos - 1] != '\n') {
+                    const nl = std.mem.indexOfScalarPos(u8, hay, pos, '\n') orelse return last;
+                    pos = nl + 1;
+                    state = try d.startState(.newline);
+                    // At the very end (just after a final newline) the
+                    // end-of-text step still sees a line start.
+                    if (pos >= hay.len) break :outer;
                 }
+            }
+            if (has_first and d.idle.items[state]) {
+                // Nothing is running: jump to the next byte a match can start with.
+                const q = d.skipIdle(hay, pos);
                 // The pattern cannot match empty, so it needs a byte.
                 if (q >= hay.len) return last;
                 if (q != pos) {
                     pos = q;
                     state = try d.startState(kindBefore(hay, pos));
                 }
-            };
-            const e = try d.step(state, d.classes[hay[pos]]);
-            if (e & 1 != 0) {
-                last = pos;
-                if (first_only) return last;
             }
-            state = e >> 1;
-            if (state == 0) return last;
-            pos += 1;
+            // Hot loop: one table lookup per byte; leave it for an unknown
+            // transition, a match end, the dead state, or an idle state.
+            var trans = d.trans.items;
+            while (true) {
+                const e = trans[@as(usize, state) * stride + classes[hay[pos]]];
+                if (e == unknown or e & 1 != 0) {
+                    const e2 = if (e == unknown) try d.step(state, classes[hay[pos]]) else e;
+                    if (e2 & 1 != 0) {
+                        last = pos;
+                        if (first_only) return last;
+                    }
+                    state = e2 >> 1;
+                    if (state == 0) return last;
+                    pos += 1;
+                    if (pos >= hay.len) break :outer;
+                    continue :outer;
+                }
+                state = e >> 1;
+                if (state == 0) return last;
+                pos += 1;
+                if (pos >= hay.len) break :outer;
+                if (d.idle.items[state] and (has_first or d.start_anchor != .none)) continue :outer;
+                trans = d.trans.items;
+            }
         }
         const e = try d.step(state, d.nclasses);
         if (e & 1 != 0) last = pos;
         return last;
+    }
+
+    /// The first position at or after `pos` where a match can start (the end
+    /// of `hay` when none). Only valid for a forward DFA with a first-byte set.
+    pub fn skipIdle(d: *const Dfa, hay: []const u8, pos: usize) usize {
+        if (d.prefix.len >= 2) return indexOfNeedle(hay, pos, d.prefix) orelse hay.len;
+        switch (d.first_n) {
+            1 => return std.mem.indexOfScalarPos(u8, hay, pos, d.first_bytes[0]) orelse hay.len,
+            2, 3 => return indexOfAny3(hay, pos, d.first_bytes[0], d.first_bytes[if (d.first_n > 1) 1 else 0], d.first_bytes[if (d.first_n > 2) 2 else 0]),
+            else => {
+                var q = pos;
+                while (q < hay.len and !d.first_tab[hay[q]]) q += 1;
+                return q;
+            },
+        }
     }
 
     /// Reverse, anchored at `end`: the smallest position at or after `from`

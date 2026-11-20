@@ -44,6 +44,19 @@ const throughput_cases = [_]Case{
     .{ .name = "utf8 [^a] run", .pattern = "[^a]+", .kind = .unicode_text, .size = 1 << 20, .options = .{ .utf8 = true, .limits = no_step_limit } },
 };
 
+/// Line-search cases (the grep question: does each line match?), run through
+/// `Searcher.matchingLines` the way util-core's grep does.
+const line_cases = [_]Case{
+    .{ .name = "lines ^[a-m]+[[:space:]][n-z]+", .pattern = "^[a-m]+[[:space:]][n-z]+", .kind = .prose, .size = 10 << 20, .options = .{ .dialect = .posix_ere } },
+    .{ .name = "lines -x (two|the)s?", .pattern = "^((two|the)s?)$", .kind = .prose, .size = 10 << 20, .options = .{ .dialect = .posix_ere } },
+    .{ .name = "lines (two|the)s?", .pattern = "(two|the)s?", .kind = .prose, .size = 10 << 20, .options = .{ .dialect = .posix_ere } },
+    .{ .name = "lines literal fox", .pattern = "fox", .kind = .prose, .size = 10 << 20, .options = .{ .dialect = .posix_ere } },
+    .{ .name = "lines literal absent", .pattern = "zqxjv", .kind = .prose, .size = 10 << 20, .options = .{ .dialect = .posix_ere } },
+    .{ .name = "lines utf8 .", .pattern = ".", .kind = .unicode_text, .size = 10 << 20, .options = .{ .dialect = .posix_ere, .utf8 = true } },
+    .{ .name = "lines utf8 -i the", .pattern = "the", .kind = .unicode_text, .size = 10 << 20, .options = .{ .dialect = .posix_ere, .utf8 = true, .ignore_case = true } },
+    .{ .name = "lines utf8 -i café", .pattern = "CAFÉ", .kind = .unicode_text, .size = 10 << 20, .options = .{ .dialect = .posix_ere, .utf8 = true, .ignore_case = true } },
+};
+
 const Pathological = struct { name: []const u8, pattern: []const u8, unit: []const u8, repeats: usize, tail: []const u8 };
 
 const pathological_cases = [_]Pathological{
@@ -156,6 +169,65 @@ fn runThroughput(io: std.Io, gpa: std.mem.Allocator, c: Case) !void {
     std.debug.print("{s:<28} compile {d:>7} ns   {d:>9.2} ms   {d:>8.1} MB/s   {d} matches\n", .{ c.name, @as(u64, @intCast(compile_ns)), secs * 1000.0, mb / secs, matches });
 }
 
+fn runLines(io: std.Io, gpa: std.mem.Allocator, c: Case) !void {
+    const hay = try generate(gpa, c.kind, c.size);
+    defer gpa.free(hay);
+    var re = try regex.Regex.compile(gpa, c.pattern, c.options, null);
+    defer re.deinit(gpa);
+    var s = try re.searcher(gpa);
+    defer s.deinit();
+    var best: i96 = std.math.maxInt(i96);
+    var n: usize = 0;
+    for (0..5) |_| {
+        const start = now(io);
+        var it = s.matchingLines(hay, false);
+        n = 0;
+        while (try it.next()) |_| n += 1;
+        best = @min(best, now(io) - start);
+    }
+    const secs = @as(f64, @floatFromInt(best)) / 1e9;
+    const mb = @as(f64, @floatFromInt(hay.len)) / (1024.0 * 1024.0);
+    std.debug.print("{s:<32} {d:>9.2} ms   {d:>8.1} MB/s   {d} lines\n", .{ c.name, secs * 1000.0, mb / secs, n });
+}
+
+/// A RegexSet of many words (`grep -f words`), searched line by line.
+fn runSet(io: std.Io, gpa: std.mem.Allocator, nwords: usize) !void {
+    const hay = try generate(gpa, .prose, 10 << 20);
+    defer gpa.free(hay);
+    var rng = std.Random.DefaultPrng.init(0xfeed);
+    const r = rng.random();
+    var store: std.ArrayList(u8) = .empty;
+    defer store.deinit(gpa);
+    var pats: std.ArrayList([]const u8) = .empty;
+    defer pats.deinit(gpa);
+    var offs: std.ArrayList([2]usize) = .empty;
+    defer offs.deinit(gpa);
+    for (0..nwords) |_| {
+        const len = 5 + r.uintLessThan(usize, 6);
+        const o = store.items.len;
+        for (0..len) |_| try store.append(gpa, 'a' + r.uintLessThan(u8, 26));
+        try offs.append(gpa, .{ o, store.items.len });
+    }
+    for (offs.items) |o| try pats.append(gpa, store.items[o[0]..o[1]]);
+    const t0 = now(io);
+    var set = try regex.RegexSet.compile(gpa, pats.items, .{ .dialect = .posix_ere }, null);
+    defer set.deinit(gpa);
+    const compile_ms = @as(f64, @floatFromInt(now(io) - t0)) / 1e6;
+    var s = try set.searcher(gpa);
+    defer s.deinit();
+    var best: i96 = std.math.maxInt(i96);
+    var n: usize = 0;
+    for (0..3) |_| {
+        const start = now(io);
+        var it = s.matchingLines(hay, false);
+        n = 0;
+        while (try it.next()) |_| n += 1;
+        best = @min(best, now(io) - start);
+    }
+    const secs = @as(f64, @floatFromInt(best)) / 1e9;
+    std.debug.print("set of {d:<5} words, lines      {d:>9.2} ms   (compile {d:.1} ms)   {d} lines\n", .{ nwords, secs * 1000.0, compile_ms, n });
+}
+
 fn runPathological(io: std.Io, gpa: std.mem.Allocator, c: Pathological) !void {
     const hay = try gpa.alloc(u8, c.unit.len * c.repeats + c.tail.len);
     defer gpa.free(hay);
@@ -183,6 +255,9 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("regex-zig benchmarks (best of 5; ReleaseFast)\n\n", .{});
     std.debug.print("-- throughput --\n", .{});
     for (throughput_cases) |c| try runThroughput(io, gpa, c);
+    std.debug.print("\n-- line search (10 MB) --\n", .{});
+    for (line_cases) |c| try runLines(io, gpa, c);
+    for ([_]usize{ 10, 300, 3000 }) |n| try runSet(io, gpa, n);
     std.debug.print("\n-- pathological patterns, default limits --\n", .{});
     for (pathological_cases) |c| try runPathological(io, gpa, c);
 }

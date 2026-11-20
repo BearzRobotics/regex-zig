@@ -1562,3 +1562,84 @@ test "allocation failure: sets and replacement" {
         if (!fa.has_induced_failure) break;
     }
 }
+
+/// Reference for matchingLines: every line tested on its own with the
+/// backtracking engine, which has no skipping.
+fn linesReference(pattern: []const u8, hay: []const u8, opts: regex.Options, out: *std.ArrayList(usize)) !void {
+    var bo = opts;
+    bo.engine = .backtrack;
+    var re = try regex.Regex.compile(gpa, pattern, bo, null);
+    defer re.deinit(gpa);
+    var s = try re.searcher(gpa);
+    defer s.deinit();
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, hay, '\n');
+    while (it.next()) |line| {
+        n += 1;
+        if (it.peek() == null and line.len == 0) break;
+        if ((try s.find(line, 0)) != null) try out.append(gpa, n);
+    }
+}
+
+test "perf: matchingLines skipping agrees with per-line search (numbers, offsets)" {
+    const hay = "fox\n\nabc\nxfoxy\n\n\nthe two\nzzz\nfo\nfox fox\nends with fox";
+    const cases = [_]struct { pat: []const u8, opts: regex.Options }{
+        .{ .pat = "fox", .opts = .{} },
+        .{ .pat = "f", .opts = .{} },
+        .{ .pat = "[fz]", .opts = .{} },
+        .{ .pat = "^fox", .opts = .{ .dialect = .posix_ere } },
+        .{ .pat = "^((two|the)s?)$", .opts = .{ .dialect = .posix_ere } },
+        .{ .pat = "(two|the)s?", .opts = .{ .dialect = .posix_ere } },
+        .{ .pat = "^[a-m]+ [n-z]+", .opts = .{ .dialect = .posix_ere } },
+        .{ .pat = "fox$", .opts = .{ .dialect = .posix_ere } },
+        .{ .pat = "FOX", .opts = .{ .ignore_case = true } },
+        .{ .pat = "zzzq", .opts = .{} },
+        .{ .pat = "x*", .opts = .{} },
+    };
+    for (cases) |c| {
+        var want: std.ArrayList(usize) = .empty;
+        defer want.deinit(gpa);
+        try linesReference(c.pat, hay, c.opts, &want);
+        var re = try regex.Regex.compile(gpa, c.pat, c.opts, null);
+        defer re.deinit(gpa);
+        var s = try re.searcher(gpa);
+        defer s.deinit();
+        var it = s.matchingLines(hay, false);
+        var got: std.ArrayList(usize) = .empty;
+        defer got.deinit(gpa);
+        while (try it.next()) |l| {
+            try got.append(gpa, l.number);
+            try std.testing.expect(std.mem.startsWith(u8, hay[l.start..], l.text));
+        }
+        try std.testing.expectEqualSlices(usize, want.items, got.items);
+    }
+}
+
+test "perf: DFA start anchors, first-byte skipping and long haystacks agree with the Pike VM" {
+    const pats = [_][]const u8{ "^ab", "^ab|^cd", "\\Aab", "(?m)^b+", "^a|b", "q", "[qz]", "[qzy]", "[qzyx]", "needle", "nee+dle" };
+    var buf: [3000]u8 = undefined;
+    var rng = std.Random.DefaultPrng.init(7);
+    for (&buf) |*b| b.* = "abcqzyx\n e"[rng.random().uintLessThan(usize, 10)];
+    @memcpy(buf[2000..][0..6], "needle");
+    for (pats) |pat| {
+        var a = try regex.Regex.compile(gpa, pat, .{ .engine = .dfa }, null);
+        defer a.deinit(gpa);
+        var b = try regex.Regex.compile(gpa, pat, .{ .engine = .pike }, null);
+        defer b.deinit(gpa);
+        var sa = try a.searcher(gpa);
+        defer sa.deinit();
+        var sb = try b.searcher(gpa);
+        defer sb.deinit();
+        var from: usize = 0;
+        while (from < buf.len) : (from += 37) {
+            const x = try sa.find(&buf, from);
+            const y = try sb.find(&buf, from);
+            try std.testing.expectEqual(y != null, x != null);
+            if (x) |m| {
+                try std.testing.expectEqual(y.?.start(), m.start());
+                try std.testing.expectEqual(y.?.end(), m.end());
+            }
+        }
+        try std.testing.expectEqual(try sb.matchesAnywhere(&buf), try sa.matchesAnywhere(&buf));
+    }
+}

@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.4.0
+
+Performance release: the lazy DFA's hot loop, found expensive by util-core's grep benchmarks (callgrind: about 64 instructions per byte).
+
+### Changed
+- **DFA hot loop.** The per-byte `step` call is gone: the search loop is one transition-table lookup per byte and leaves the loop only for an uncomputed transition, a match end, the dead state, or an idle state. Before, every skip also recomputed `ByteSet.count()` and scanned 256 `has()` calls when the first-byte set had one member.
+- **First-byte info is precomputed** when the DFA is built: a 256-entry table, and the members when there are one to three. One byte uses `indexOfScalar`, two or three use a 32-lane vector scan, more use the table.
+- **Literal prefixes** are searched with a 32-lane first-and-last-byte vector scan instead of `std.mem.indexOfPos`.
+- **Start anchors.** When every match begins with `^` (or `\A`), an idle DFA jumps to the next line start instead of testing each byte.
+- **`Searcher.matchingLines`** skips, in a single scan, all lines that lack a byte a match can start with (literal prefix or one to three first bytes), counting the skipped newlines with vectors.
+
+### Added
+- `Searcher.nextCandidate(hay, pos)`: a cheap necessary condition for a match start, or null when the pattern has none.
+- `zig build bench` has a line-search section (10 MB, `matchingLines`) and `RegexSet` cases with 10, 300 and 3000 words.
+- Tests: `matchingLines` skipping against per-line backtracking, DFA anchors and skipping against the Pike VM.
+
+### Performance (`zig build bench`, ReleaseFast, one machine, ms for 10 MB of prose unless noted; before is 0.3.0)
+| case | 0.3.0 | 0.4.0 |
+|---|---|---|
+| lines `^[a-m]+[[:space:]][n-z]+` | 40.6 | 3.6 |
+| lines `^((two\|the)s?)$` | 33.4 | 3.7 |
+| lines `(two\|the)s?` | 19.9 | 6-7 |
+| lines literal `fox` | 13.9 | 3.8 |
+| lines literal absent | 11.7 | 0.23 |
+| lines UTF-8 `-i` | 6.5 | 4.3 |
+| lines UTF-8 `.` | 3.1 | 2.7 |
+| `\bfox\b` (4 MB, count) | 8.4 | 2.1 |
+| `(?i)quick` (4 MB, count) | 3.0 | 1.2 |
+| UTF-8 `(?i)éa` (1 MB, count) | 11.0 | 1.6 |
+| RegexSet, 3000 words | 41 | 30 |
+
+### Not done
+- No Aho-Corasick or Teddy prefilter for large `RegexSet`s; the lazy DFA already behaves like one, and its state cache is the limit.
+
 ## 0.3.0
 
 ### Added
@@ -24,7 +58,7 @@
 - Captured groups and leftmost-longest spans are found by the Pike VM, which is slower (about 17 and 47 MB/s on the benchmark); `isMatch` and `find` without groups use the DFA.
 - Sub-group positions can differ between engines for some quantified groups whose body can match the empty string, and in leftmost-longest mode follow thread priority, not the POSIX subexpression rule.
 - GNU grep selects no line for a back-reference to a repeated group that can match empty (`b|((c?)){2}\1$`); regex-zig follows Perl semantics there.
-- Streaming is line-oriented only. No SIMD prefilters of our own, no Aho-Corasick for large literal sets.
+- Streaming is line-oriented only. SIMD is limited to byte and prefix scans; no Aho-Corasick for large literal sets.
 - Full Unicode case folding (ß to ss) and `\p{Script_Extensions}` are not supported. In `utf8` mode look-behind needs a fixed width in bytes.
 - Not differentially tested against ripgrep or the Rust `regex` crate.
 

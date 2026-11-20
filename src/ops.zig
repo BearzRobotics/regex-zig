@@ -163,6 +163,19 @@ pub const MatchingLines = struct {
 
     pub fn next(it: *MatchingLines) MatchError!?Line {
         while (it.pos < it.hay.len) {
+            if (!it.invert) {
+                // Skip, in one scan, every line without a byte a match can
+                // start with; they cannot match.
+                if (it.searcher.nextCandidate(it.hay, it.pos)) |q| {
+                    if (q >= it.hay.len) {
+                        it.pos = it.hay.len;
+                        return null;
+                    }
+                    const ls = if (std.mem.lastIndexOfScalar(u8, it.hay[it.pos..q], '\n')) |i| it.pos + i + 1 else it.pos;
+                    it.number += countNewlines(it.hay[it.pos..ls]);
+                    it.pos = ls;
+                }
+            }
             const start = it.pos;
             const nl = std.mem.indexOfScalarPos(u8, it.hay, start, '\n') orelse it.hay.len;
             it.pos = nl + 1;
@@ -174,6 +187,19 @@ pub const MatchingLines = struct {
         return null;
     }
 };
+
+fn countNewlines(buf: []const u8) usize {
+    const V = 32;
+    var n: usize = 0;
+    var i: usize = 0;
+    const nl: @Vector(V, u8) = @splat('\n');
+    while (i + V <= buf.len) : (i += V) {
+        const v: @Vector(V, u8) = buf[i..][0..V].*;
+        n += @popCount(@as(u32, @bitCast(v == nl)));
+    }
+    while (i < buf.len) : (i += 1) n += @intFromBool(buf[i] == '\n');
+    return n;
+}
 
 pub fn matchingLines(s: *Searcher, hay: []const u8, invert: bool) MatchingLines {
     return .{ .searcher = s, .hay = hay, .invert = invert };

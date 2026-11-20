@@ -1,6 +1,6 @@
 # Architecture
 
-How regex-zig is put together as of version 0.3.0. Design decisions and their reasons are in `docs/decisions/`; the requirements are in `SPEC.md`.
+How regex-zig is put together as of version 0.4.0. Design decisions and their reasons are in `docs/decisions/`; the requirements are in `SPEC.md`.
 
 ## Overview
 

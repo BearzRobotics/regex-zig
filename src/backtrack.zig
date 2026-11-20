@@ -173,6 +173,18 @@ pub const Searcher = struct {
         return s.findPike(hay, start);
     }
 
+    /// A cheap necessary condition for a match: the first position at or
+    /// after `pos` where a match could start, judged from a literal prefix or
+    /// a one-to-three-byte first-byte set, or `hay.len` when there is none.
+    /// Null when the pattern has no such condition (callers then test every
+    /// position or line). Never skips a real match.
+    pub fn nextCandidate(s: *const Searcher, hay: []const u8, pos: usize) ?usize {
+        const f = &(s.fwd orelse return null);
+        if (f.first == null) return null;
+        if (f.prefix.len < 2 and (f.first_n == 0 or f.first_n > 3)) return null;
+        return f.skipIdle(hay, pos);
+    }
+
     /// True if there is a match anywhere (the grep question), without
     /// computing where.
     pub fn matchesAnywhere(s: *Searcher, hay: []const u8) MatchError!bool {

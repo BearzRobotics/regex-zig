@@ -49,7 +49,7 @@ Add it to another project with `zig fetch --save` and `b.dependency("regex", .{}
 
 ## Future work
 
-Not in 0.3.0; recorded as known limitations in `CHANGELOG.md`.
+Not in 0.4.0; recorded as known limitations in `CHANGELOG.md`.
 
 - SIMD prefilters and a required-substring prefilter.
 - Aho-Corasick (or Teddy) for large literal sets in `RegexSet`.
