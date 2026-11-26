@@ -180,7 +180,10 @@ const Compiler = struct {
     fn compile(c: *Compiler, n: *const ast.Node) parse.Error!void {
         c.depth += 1;
         defer c.depth -= 1;
-        if (c.depth > c.limits.max_depth) {
+        // The parser enforces max_depth. One of its levels is at most three
+        // tree levels (group, alternation, sequence), so this is only a
+        // backstop and never fails for a pattern the parser accepted.
+        if (c.depth > c.limits.max_depth *| 3 +| 8) {
             c.diag.* = .{ .pos = 0, .message = "pattern nesting too deep" };
             return error.LimitExceeded;
         }

@@ -48,6 +48,10 @@ pub const Dialect = enum { perl, oniguruma, posix_ere, posix_bre, rust };
 
 pub const Limits = struct {
     max_pattern_len: usize = 64 * 1024,
+    /// Levels of groups, classes and quantifiers along any branch. Parsing and
+    /// compiling recurse once or a few times per level, so lower this for
+    /// threads with very small stacks (a Debug build needs about 1 MiB for the
+    /// default).
     max_depth: u32 = 200,
     max_repeat: u32 = 1000,
     max_program_len: usize = 100_000,
@@ -134,6 +138,9 @@ const Parser = struct {
     limits: Limits,
     flags: Flags,
     depth: u32 = 0,
+    /// The greatest depth reached since it was last reset: how tall the subtree
+    /// just parsed is, which a quantifier on it adds to.
+    deepest: u32 = 0,
     /// Groups the cursor is inside.
     open_groups: u32 = 0,
     group_count: u32 = 0,
@@ -199,6 +206,7 @@ const Parser = struct {
 
     fn enter(p: *Parser) Error!void {
         p.depth += 1;
+        p.deepest = @max(p.deepest, p.depth);
         if (p.depth > p.limits.max_depth)
             return p.fail(error.LimitExceeded, p.pos, "pattern nesting too deep");
     }
@@ -412,6 +420,9 @@ const Parser = struct {
                 }
                 continue;
             }
+            const outer_deepest = p.deepest;
+            defer p.deepest = @max(p.deepest, outer_deepest);
+            p.deepest = p.depth;
             const atom = (try p.parseAtom(items.items.len == 0)) orelse continue;
             // In a basic expression an anchor cannot be repeated: a `*` after
             // `^` is a literal star.
@@ -564,6 +575,9 @@ const Parser = struct {
     fn parseQuantifiers(p: *Parser, atom: *const Node) Error!*const Node {
         var cur = atom;
         var count: u32 = 0;
+        // The levels already inside the atom. (After a \Q..\E literal this
+        // can include an earlier sibling, which only errs on the strict side.)
+        const height = p.deepest -| p.depth;
         while (true) {
             p.skipBeforeQuantifier();
             const qpos = p.pos;
@@ -587,11 +601,13 @@ const Parser = struct {
                 .lazy => .greedy,
                 .possessive => .possessive,
             };
-            try p.enter();
-            cur = try p.node(.{ .repeat = .{ .sub = cur, .min = q.min, .max = q.max, .greed = greed } });
             count += 1;
+            const total = p.depth +| height +| count;
+            if (total > p.limits.max_depth)
+                return p.fail(error.LimitExceeded, qpos, "pattern nesting too deep");
+            p.deepest = @max(p.deepest, total);
+            cur = try p.node(.{ .repeat = .{ .sub = cur, .min = q.min, .max = q.max, .greed = greed } });
         }
-        p.depth -= count;
         return cur;
     }
 

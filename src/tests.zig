@@ -1930,3 +1930,44 @@ test "malformed numbers and group names are errors" {
     try expectCompileError("(?<n>a)(?<n>b)", rust, error.InvalidPattern);
     try expectSpan("(?<n>a)(?<n>b)\\k<n>", "aba", .{ 0, 3 });
 }
+
+fn nested(open: []const u8, levels: usize, close: []const u8) ![]u8 {
+    const a = try repeated(open, levels);
+    defer gpa.free(a);
+    const b = try repeated(close, levels);
+    defer gpa.free(b);
+    return std.mem.concat(gpa, u8, &.{ a, "a", b });
+}
+
+test "limits: max_depth means the same whatever the shape of the nesting" {
+    // 199 groups inside the top level are the most the default 200 allows.
+    for ([_][]const u8{ "(", "(x", "(x|", "(?:x|y" }) |open| {
+        const ok = try nested(open, 199, ")");
+        defer gpa.free(ok);
+        var re = try regex.Regex.compile(gpa, ok, .{}, null);
+        re.deinit(gpa);
+        const deep = try nested(open, 200, ")");
+        defer gpa.free(deep);
+        try expectCompileError(deep, .{}, error.LimitExceeded);
+    }
+    // Quantifiers stacked on nested groups add up along the branch.
+    const stacked = try nested("(", 100, ")**");
+    defer gpa.free(stacked);
+    var diag: regex.Diagnostic = .{};
+    try std.testing.expectError(error.LimitExceeded, regex.Regex.compile(gpa, stacked, .{ .dialect = .posix_ere }, &diag));
+    try std.testing.expect(diag.pos > 0);
+    // Siblings do not add up.
+    const siblings = try repeated("((((a*)*)*)*)*", 100);
+    defer gpa.free(siblings);
+    var re = try regex.Regex.compile(gpa, siblings, .{ .dialect = .posix_ere }, null);
+    re.deinit(gpa);
+}
+
+test "limits: the parser guards its own recursion" {
+    // Far deeper than any stack would take if the parser did not stop.
+    const deep = try repeated("(", 60_000);
+    defer gpa.free(deep);
+    var diag: regex.Diagnostic = .{};
+    try std.testing.expectError(error.LimitExceeded, regex.Regex.compile(gpa, deep, .{}, &diag));
+    try std.testing.expectEqual(@as(usize, 199), diag.pos - 1);
+}
