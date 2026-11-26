@@ -1737,3 +1737,27 @@ test "limits: compile work is bounded when copies emit little" {
     var re = try regex.Regex.compile(gpa, "(?:(?:(?:ab)(?:c|d)){1000}){10}", .{}, null);
     re.deinit(gpa);
 }
+
+test "limits: Pike VM capture memory is bounded" {
+    // Many groups and consuming instructions: the product is what counts.
+    const many = try repeated("(a)", 4000);
+    defer gpa.free(many);
+    for ([_]regex.Engine{ .auto, .pike, .dfa }) |engine| {
+        var diag: regex.Diagnostic = .{};
+        try std.testing.expectError(error.LimitExceeded, regex.Regex.compile(gpa, many, .{ .engine = engine }, &diag));
+        try std.testing.expect(diag.message.len > 0);
+    }
+    // The backtracker keeps one register set, so it still accepts the pattern.
+    var bt = try regex.Regex.compile(gpa, many, .{ .engine = .backtrack }, null);
+    bt.deinit(gpa);
+    // Empty groups hold no threads, so they cost little.
+    const empty = try repeated("()", 4000);
+    defer gpa.free(empty);
+    var re = try regex.Regex.compile(gpa, empty, .{}, null);
+    defer re.deinit(gpa);
+    var counting = std.testing.FailingAllocator.init(gpa, .{});
+    var s = try re.searcher(counting.allocator());
+    defer s.deinit();
+    try std.testing.expect(counting.allocated_bytes < 4 * 1024 * 1024);
+    try std.testing.expect((try s.find("x", 0)) != null);
+}

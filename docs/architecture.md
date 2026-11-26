@@ -78,7 +78,7 @@ Decided once, in `program.compile`:
 |---|---|
 | Pattern length, nesting, repeat count, program size | `Limits` (compile time, errors) |
 | Backtracker | `max_steps` per `find` call, `max_stack` frames |
-| Pike VM | two thread lists of `n x (2g+2)` words, sized once; no allocation while searching |
+| Pike VM | two thread lists of `t x (2g+2)` words (`t` = instructions that can hold a thread, `g` = groups), sized once and capped by `max_capture_bytes`; no allocation while searching |
 | Lazy DFA | `max_dfa_cache` bytes per direction; cleared when full, then falls back |
 | `Searcher` | all mutable state; one per thread; the `Regex` must outlive it |
 

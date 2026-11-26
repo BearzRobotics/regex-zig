@@ -80,6 +80,17 @@ pub const Nfa = struct {
     insts: []const Inst,
     sets: []const ByteSet,
 
+    /// How many instructions can hold a thread: the consuming ones and
+    /// `match`. Each is in a thread list at most once.
+    pub fn threadSlots(n: Nfa) usize {
+        var count: usize = 0;
+        for (n.insts) |i| switch (i) {
+            .byte, .any, .any_nl, .set, .match => count += 1,
+            else => {},
+        };
+        return count;
+    }
+
     pub fn deinit(n: Nfa, gpa: std.mem.Allocator) void {
         gpa.free(n.insts);
         gpa.free(n.sets);
@@ -776,6 +787,15 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
                 diag.* = .{};
             },
             else => return e,
+        }
+    }
+
+    if (nfa) |n| {
+        // The Pike VM's two thread lists each hold a capture array per slot.
+        const per_slot = 2 * 2 * (@as(usize, parsed.group_count) + 1) * @sizeOf(usize);
+        if (n.threadSlots() *| per_slot > limits.max_capture_bytes) {
+            diag.* = .{ .pos = 0, .message = "too many capture groups for the pattern's size (Limits.max_capture_bytes)" };
+            return error.LimitExceeded;
         }
     }
 

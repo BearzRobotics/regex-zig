@@ -51,6 +51,10 @@ pub const Limits = struct {
     max_depth: u32 = 200,
     max_repeat: u32 = 1000,
     max_program_len: usize = 100_000,
+    /// Bytes of capture slots the Pike VM may reserve in each Searcher. The
+    /// need grows with (instructions that can hold a thread) x (groups).
+    /// A pattern that needs more is refused at compile time.
+    max_capture_bytes: usize = 64 * 1024 * 1024,
     /// Backtracking steps allowed per find call.
     max_steps: u64 = 10_000_000,
     /// Backtrack-stack frames allowed.

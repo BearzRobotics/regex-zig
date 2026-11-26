@@ -48,7 +48,7 @@ A large pattern may exceed `max_program_len` in this form (for example `\p{L}{10
 
 ## 5. Resource use
 
-- Pike VM memory: two thread lists, each with a capture array per instruction: about `2 × n × (2g + 2) × 8` bytes for `n` instructions and `g` groups, allocated once per `Searcher`. A program has at most `max_program_len` instructions.
+- Pike VM memory: two thread lists, each with a capture array per instruction: about `2 × t × (2g + 2) × 8` bytes for `t` instructions that can hold a thread (byte-consuming ones and `match`) and `g` groups, allocated once per `Searcher`. This grows with the product, so it is capped by `Limits.max_capture_bytes` (64 MiB by default), checked at compile time.
 - No allocation during a search. The explicit stack used for the closure is bounded by the instruction count and reused.
 - The step budget does not apply to the Pike VM, because its work is bounded by input size.
 

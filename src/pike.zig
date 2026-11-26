@@ -38,14 +38,15 @@ const List = struct {
     thread_caps: []usize,
     nthreads: usize = 0,
 
-    fn init(gpa: std.mem.Allocator, n: usize, ncap: usize) !List {
+    /// `n` instructions, of which `slots` can hold a thread.
+    fn init(gpa: std.mem.Allocator, n: usize, slots: usize, ncap: usize) !List {
         const dense = try gpa.alloc(u32, n);
         errdefer gpa.free(dense);
         const sparse = try gpa.alloc(u32, n);
         errdefer gpa.free(sparse);
-        const thread_pc = try gpa.alloc(u32, n);
+        const thread_pc = try gpa.alloc(u32, slots);
         errdefer gpa.free(thread_pc);
-        const thread_caps = try gpa.alloc(usize, n * ncap);
+        const thread_caps = try gpa.alloc(usize, slots * ncap);
         return .{ .dense = dense, .sparse = sparse, .thread_pc = thread_pc, .thread_caps = thread_caps };
     }
 
@@ -101,9 +102,10 @@ pub const Pike = struct {
         const nfa = prog.nfa.?;
         const n = nfa.insts.len;
         const ncap = 2 * (prog.group_count + 1);
-        var clist = try List.init(gpa, n, ncap);
+        const slots = nfa.threadSlots();
+        var clist = try List.init(gpa, n, slots, ncap);
         errdefer clist.deinit(gpa);
-        var nlist = try List.init(gpa, n, ncap);
+        var nlist = try List.init(gpa, n, slots, ncap);
         errdefer nlist.deinit(gpa);
         // Each instruction is visited once per closure and pushes at most one
         // frame for a split and one for a capture, so 2n+2 frames suffice and
