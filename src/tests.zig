@@ -1776,3 +1776,18 @@ test "limits: repeated Unicode classes do not multiply memory" {
         try std.testing.expect(counting.allocated_bytes < 64 * 1024 * 1024);
     }
 }
+
+test "limits: the step budget counts the bytes back-references compare" {
+    // About 2,000 instructions, but 900,000 bytes compared.
+    const hay = try repeated("a", 901_000);
+    defer gpa.free(hay);
+    for ([_]bool{ false, true }) |folded| {
+        var re = try regex.Regex.compile(gpa, "^(a{1000})\\1{900}$", .{ .ignore_case = folded, .utf8 = folded, .limits = .{ .max_steps = 10_000 } }, null);
+        defer re.deinit(gpa);
+        var s = try re.searcher(gpa);
+        defer s.deinit();
+        try std.testing.expectError(error.StepLimitExceeded, s.find(hay, 0));
+        s.limits.max_steps = 100_000;
+        try std.testing.expect((try s.find(hay, 0)) != null);
+    }
+}

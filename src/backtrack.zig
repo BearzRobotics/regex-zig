@@ -16,6 +16,11 @@ const utf8 = @import("utf8.zig");
 const unicode = @import("unicode.zig");
 
 const Program = program.Program;
+
+/// A back-reference costs one extra step for each this many bytes it compares,
+/// so that the step budget bounds the time of a search and not only the number
+/// of instructions. Short references cost what any instruction does.
+const compare_bytes_per_step = 32;
 const unset = program.unset;
 
 pub const MatchError = error{
@@ -332,10 +337,15 @@ pub const Searcher = struct {
                     // A group that did not participate makes the reference fail.
                     if (a == unset or e == unset) {
                         ok = false;
-                    } else if (backrefLen(hay, a, e, pos, b.ignore_case, s.prog.utf8)) |n| {
-                        pos += n;
-                        pc += 1;
-                    } else ok = false;
+                    } else {
+                        const r = backref(hay, a, e, pos, b.ignore_case, s.prog.utf8);
+                        // Checked before the next instruction.
+                        s.steps +|= r.compared / compare_bytes_per_step;
+                        if (r.len) |n| {
+                            pos += n;
+                            pc += 1;
+                        } else ok = false;
+                    }
                 },
                 .atomic_start => {
                     try s.push(.{ .marker = .{ .kind = .atomic, .pos = pos, .resume_pc = 0 } });
@@ -387,14 +397,29 @@ pub const Searcher = struct {
     }
 };
 
-/// Length of the text at `pos` that equals the captured text hay[a..e], or
-/// null. Case-insensitive comparison in utf8 mode works on characters (simple
-/// case folding), so the two texts may differ in byte length.
-fn backrefLen(hay: []const u8, a: usize, e: usize, pos: usize, ignore_case: bool, utf8_mode: bool) ?usize {
+const BackrefResult = struct {
+    /// Length of the matching text, or null.
+    len: ?usize,
+    /// Roughly how many bytes of the capture were looked at.
+    compared: usize,
+};
+
+/// Compares the text at `pos` with the captured text hay[a..e].
+/// Case-insensitive comparison in utf8 mode works on characters (simple case
+/// folding), so the two texts may differ in byte length.
+fn backref(hay: []const u8, a: usize, e: usize, pos: usize, ignore_case: bool, utf8_mode: bool) BackrefResult {
     if (!ignore_case or !utf8_mode) {
         const len = e - a;
-        if (hay.len - pos >= len and eqlBytes(hay[a..e], hay[pos..][0..len], ignore_case)) return len;
-        return null;
+        if (hay.len - pos < len) return .{ .len = null, .compared = 0 };
+        // In chunks, so a mismatch reports how far the comparison got.
+        var done: usize = 0;
+        while (done < len) {
+            const n = @min(len - done, compare_bytes_per_step);
+            if (!eqlBytes(hay[a + done ..][0..n], hay[pos + done ..][0..n], ignore_case))
+                return .{ .len = null, .compared = done };
+            done += n;
+        }
+        return .{ .len = len, .compared = len };
     }
     var i = a;
     var j = pos;
@@ -402,17 +427,17 @@ fn backrefLen(hay: []const u8, a: usize, e: usize, pos: usize, ignore_case: bool
         const x = context.decodeAt(hay, i);
         const y = context.decodeAt(hay, j);
         if (x != null and y != null and i + x.?.len <= e) {
-            if (!unicode.eqlFold(x.?.cp, y.?.cp)) return null;
+            if (!unicode.eqlFold(x.?.cp, y.?.cp)) return .{ .len = null, .compared = i - a };
             i += x.?.len;
             j += y.?.len;
         } else {
             // Not a whole character: compare the bytes themselves.
-            if (j >= hay.len or hay[j] != hay[i]) return null;
+            if (j >= hay.len or hay[j] != hay[i]) return .{ .len = null, .compared = i - a };
             i += 1;
             j += 1;
         }
     }
-    return j - pos;
+    return .{ .len = j - pos, .compared = e - a };
 }
 
 fn eqlBytes(a: []const u8, b: []const u8, ignore_case: bool) bool {

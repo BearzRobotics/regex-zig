@@ -55,7 +55,8 @@ pub const Limits = struct {
     /// need grows with (instructions that can hold a thread) x (groups).
     /// A pattern that needs more is refused at compile time.
     max_capture_bytes: usize = 64 * 1024 * 1024,
-    /// Backtracking steps allowed per find call.
+    /// Backtracking steps allowed per find call: one per instruction, plus
+    /// one for every 32 bytes a back-reference compares.
     max_steps: u64 = 10_000_000,
     /// Backtrack-stack frames allowed.
     max_stack: usize = 4 * 1024 * 1024,
