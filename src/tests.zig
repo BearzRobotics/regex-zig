@@ -656,7 +656,8 @@ test "utf8: \\b is Unicode-aware" {
 
 test "utf8: large classes stay small and run in one step per character" {
     if (!unicode.enabled) return error.SkipZigTest;
-    var re = try regex.Regex.compile(gpa, "\\p{L}+", u8opts, null);
+    // The backtracker is the engine with cp_class and a step budget.
+    var re = try regex.Regex.compile(gpa, "\\p{L}+", .{ .utf8 = true, .engine = .backtrack }, null);
     defer re.deinit(gpa);
     // The set is far too big to lower to byte sequences; it uses cp_class.
     try std.testing.expect(re.prog.insts.len < 20);
