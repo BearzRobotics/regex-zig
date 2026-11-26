@@ -83,6 +83,18 @@ pub const Regex = struct {
         return Searcher.init(gpa, re.prog, re.limits);
     }
 
+    /// True when each search runs in time linear in the input (the DFA or the
+    /// Pike VM). False when the backtracker runs the pattern, bounded only by
+    /// `Limits.max_steps` and `max_stack`: because it needs it (back-reference,
+    /// look-around, atomic group, possessive quantifier), because it is too
+    /// large for the linear-time program (`max_program_len`; this can happen
+    /// to a large Unicode repeat such as `\p{L}{40}` in any dialect), or
+    /// because `Options.engine` asked for it. Check this before accepting
+    /// untrusted patterns that must not backtrack. The bound is per `find`.
+    pub fn isLinearTime(re: *const Regex) bool {
+        return re.prog.engine != .backtrack;
+    }
+
     /// Number of capture groups (not counting group 0).
     pub fn groupCount(re: *const Regex) u32 {
         return re.prog.group_count;
@@ -127,6 +139,12 @@ pub const RegexSet = struct {
         for (set.each) |*r| r.deinit(gpa);
         gpa.free(set.each);
         set.all.deinit(gpa);
+    }
+
+    /// `Regex.isLinearTime` for the combined pattern and every member.
+    pub fn isLinearTime(set: *const RegexSet) bool {
+        for (set.each) |*re| if (!re.isLinearTime()) return false;
+        return set.all.isLinearTime();
     }
 
     pub fn len(set: *const RegexSet) usize {

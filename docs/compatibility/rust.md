@@ -13,7 +13,7 @@ The syntax of the Rust `regex` crate (as used by ripgrep), implemented from its 
 
 ## Rejected (errors, never ignored)
 
-Back-references (`\1`, `\k<n>`), look-around, atomic groups, comments `(?#...)`, possessive quantifiers and nested quantifiers (`a**`, `a*+`), `\Z \G \Q \E \R \X \K \C \h`, and `(?-u)` (Unicode mode is the `utf8` option, for the whole pattern). Every accepted pattern runs on the linear-time engines.
+Back-references (`\1`, `\k<n>`), look-around, atomic groups, comments `(?#...)`, possessive quantifiers and nested quantifiers (`a**`, `a*+`), `\Z \G \Q \E \R \X \K \C \h`, and `(?-u)` (Unicode mode is the `utf8` option, for the whole pattern). No construct in this syntax needs the backtracker, so patterns run on the linear-time engines, with one exception: a pattern whose linear-time program would exceed `Limits.max_program_len` (a large Unicode repeat such as `\p{L}{40}` in `utf8` mode) falls back to the bounded backtracker. `Regex.isLinearTime()` tells which happened; a caller that accepts untrusted patterns should check it.
 
 ## Differences from the crate
 

@@ -1,6 +1,6 @@
 # regex-zig
 
-A pure-Zig regular-expression library. Syntaxes: Perl, Oniguruma, POSIX ERE and BRE (with the GNU extensions), and the Rust `regex` syntax. Engines: a lazy DFA and a Pike VM (linear time) for ordinary patterns, a bounded backtracker for back-references and look-around. Optional UTF-8 / Unicode matching, pattern sets, and line-oriented search over memory or a `std.Io.Reader`. Requires Zig 0.17. See `SPEC.md` for the goals and `CHANGELOG.md` for what each release contains.
+A pure-Zig regular-expression library. Syntaxes: Perl, Oniguruma, POSIX ERE and BRE (with the GNU extensions), and the Rust `regex` syntax. Engines: a lazy DFA and a Pike VM (linear time) for ordinary patterns, a bounded backtracker for back-references and look-around, and for patterns too large for the linear-time program (`Regex.isLinearTime()` tells which you got). Optional UTF-8 / Unicode matching, pattern sets, and line-oriented search over memory or a `std.Io.Reader`. Requires Zig 0.17. See `SPEC.md` for the goals and `CHANGELOG.md` for what each release contains.
 
 ```zig
 const regex = @import("regex");

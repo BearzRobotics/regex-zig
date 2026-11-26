@@ -1236,12 +1236,28 @@ test "rust: unsupported constructs are errors" {
     try expectSpanOpts("(a)\\1", "aa", .{ 0, 2 }, .{});
 }
 
-test "rust: every pattern runs on a linear-time engine" {
+test "rust: ordinary patterns run on a linear-time engine" {
     for ([_][]const u8{ "a(b|c)*d", "(?i)x+y", "[a-z&&[^aeiou]]+", "\\bfoo\\b", "(a*)*b" }) |pat| {
         var re = try regex.Regex.compile(gpa, pat, rust, null);
         defer re.deinit(gpa);
-        try std.testing.expect(re.prog.engine != .backtrack);
+        try std.testing.expect(re.isLinearTime());
     }
+}
+
+test "isLinearTime reports the fallback to the backtracker" {
+    var plain = try regex.Regex.compile(gpa, "a+", .{}, null);
+    defer plain.deinit(gpa);
+    try std.testing.expect(plain.isLinearTime());
+    var needs = try regex.Regex.compile(gpa, "(a)\\1", .{}, null);
+    defer needs.deinit(gpa);
+    try std.testing.expect(!needs.isLinearTime());
+    var set = try regex.RegexSet.compile(gpa, &.{ "a", "(?=b)b" }, .{}, null);
+    defer set.deinit(gpa);
+    try std.testing.expect(!set.isLinearTime());
+    if (!unicode.enabled) return;
+    var large = try regex.Regex.compile(gpa, "\\p{L}{40}", .{ .dialect = .rust, .utf8 = true }, null);
+    defer large.deinit(gpa);
+    try std.testing.expect(!large.isLinearTime());
 }
 
 test "rust: class set operations" {
