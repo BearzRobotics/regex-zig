@@ -1644,3 +1644,29 @@ test "perf: DFA start anchors, first-byte skipping and long haystacks agree with
         try std.testing.expectEqual(try sb.matchesAnywhere(&buf), try sa.matchesAnywhere(&buf));
     }
 }
+
+// ---- regressions ----------------------------------------------------------------
+
+test "a cp_class that fails to compile is freed once: size limit" {
+    if (!unicode.enabled) return error.SkipZigTest;
+    // The sweep reaches the case where the cp_class instruction itself is the
+    // one over the limit.
+    var m: usize = 0;
+    while (m < 40) : (m += 1) {
+        var re = regex.Regex.compile(gpa, "ab\\p{L}c\\W", .{ .utf8 = true, .limits = .{ .max_program_len = m } }, null) catch |e| {
+            try std.testing.expectEqual(error.LimitExceeded, e);
+            continue;
+        };
+        re.deinit(gpa);
+    }
+}
+
+fn compileSet(a: std.mem.Allocator) !void {
+    var set = try regex.RegexSet.compile(a, &.{ "(?<n>ab)", "c+", "\\p{L}é" }, .{ .utf8 = true }, null);
+    set.deinit(a);
+}
+
+test "a cp_class that fails to compile is freed once: allocation failure" {
+    if (!unicode.enabled) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(gpa, compileSet, .{});
+}

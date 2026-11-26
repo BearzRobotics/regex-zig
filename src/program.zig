@@ -235,9 +235,13 @@ const Compiler = struct {
                 }
             }
             const copy = try c.gpa.dupe(utf8.CpRange, ranges);
-            errdefer c.gpa.free(copy);
-            try c.cp_sources.ensureUnusedCapacity(c.gpa, 1);
-            try c.cp_sets.append(c.gpa, copy);
+            {
+                // Only until `cp_sets` owns the copy: after that `build` frees
+                // it, also when the `emit` below fails.
+                errdefer c.gpa.free(copy);
+                try c.cp_sources.ensureUnusedCapacity(c.gpa, 1);
+                try c.cp_sets.append(c.gpa, copy);
+            }
             c.cp_sources.appendAssumeCapacity(ranges);
             _ = try c.emit(.{ .cp_class = @intCast(c.cp_sets.items.len - 1) });
             return;
