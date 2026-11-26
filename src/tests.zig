@@ -322,6 +322,18 @@ test "posix_ere dialect" {
     // `*?` is `(*)?`: greedy, not lazy.
     try expectSpanOpts("a*?", "aaa", .{ 0, 3 }, ere);
     try expectSpanOpts("a+?b", "aab", .{ 0, 3 }, ere);
+    // GNU: `\\Q` is a plain Q, `{,n}` starts at zero, a lone `)` is literal.
+    try expectSpanOpts("\\Qa.b", "Qaxb", .{ 0, 4 }, ere);
+    try expectSpanOpts("a\\Q+", "aQQ", .{ 0, 3 }, ere);
+    try expectSpanOpts("\\E", "E", .{ 0, 1 }, ere);
+    try expectSpanOpts("a{,2}b", "aaab", .{ 1, 4 }, ere);
+    try expectSpanOpts("^a{,}$", "aaa", .{ 0, 3 }, ere);
+    try expectSpanOpts("a{,x}", "a{,x}", .{ 0, 5 }, ere);
+    try expectSpanOpts("a)b", "a)b", .{ 0, 3 }, ere);
+    try expectSpanOpts("(a))", "a)", .{ 0, 2 }, ere);
+    try expectSpanOpts("a)*", "a))", .{ 0, 3 }, ere);
+    try expectSpanOpts("a|)", "x)", .{ 1, 2 }, ere);
+    try expectCompileError("(a", ere, error.InvalidPattern);
     // `(?` has no meaning in ERE.
     try std.testing.expectError(error.InvalidPattern, regex.Regex.compile(gpa, "(?:a)", ere, null));
     // GNU escapes; others are the character itself.
@@ -1152,6 +1164,8 @@ test "bre: syntax errors" {
     try expectCompileError("a\\{3,2\\}", bre_opts, error.InvalidPattern);
     try expectCompileError("\\{1\\}", bre_opts, error.InvalidPattern);
     try expectCompileError("a\\{\\}", bre_opts, error.InvalidPattern);
+    try expectSpanOpts("^a\\{,\\}$", "aaa", .{ 0, 3 }, bre_opts);
+    try expectSpanOpts("a)", "a)", .{ 0, 2 }, bre_opts);
     try expectCompileError("a\\{2000\\}", bre_opts, error.LimitExceeded);
 }
 

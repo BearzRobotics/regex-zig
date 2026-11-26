@@ -134,6 +134,8 @@ const Parser = struct {
     limits: Limits,
     flags: Flags,
     depth: u32 = 0,
+    /// Groups the cursor is inside.
+    open_groups: u32 = 0,
     group_count: u32 = 0,
     names: std.ArrayList(Name) = .empty,
     max_backref: u32 = 0,
@@ -157,6 +159,8 @@ const Parser = struct {
 
     /// The end of a group: `)`, or `\)` in a basic expression.
     fn atGroupClose(p: *Parser) bool {
+        // In an extended expression a ')' with no group open is a literal.
+        if (p.dialect == .posix_ere and p.open_groups == 0) return false;
         return if (p.dialect == .posix_bre) p.startsWith("\\)") else p.peek() == ')';
     }
 
@@ -392,7 +396,7 @@ const Parser = struct {
             const c = p.peek() orelse break;
             _ = c;
             if (p.atAltBar() or p.atGroupClose()) break;
-            if (p.dialect != .posix_bre and p.dialect != .rust and p.startsWith("\\Q")) {
+            if (!p.posix() and p.dialect != .rust and p.startsWith("\\Q")) {
                 // \Q...\E: literal text. A following quantifier binds to the
                 // last character only, as in Perl.
                 p.pos += 2;
@@ -467,7 +471,13 @@ const Parser = struct {
                     hi = p.boundNumber();
                 }
                 const closed = p.eat('}');
-                const valid = closed and (lo != null or (has_comma and hi != null and p.dialect == .oniguruma));
+                // `{,n}` is `{0,n}`; GNU also reads `{,}` as `*`.
+                const open_lower = switch (p.dialect) {
+                    .oniguruma => has_comma and hi != null,
+                    .posix_ere => has_comma,
+                    .perl, .posix_bre, .rust => false,
+                };
+                const valid = closed and (lo != null or open_lower);
                 if (!valid) {
                     // The Rust syntax has no literal '{'.
                     if (p.dialect == .rust)
@@ -510,7 +520,7 @@ const Parser = struct {
         }
         if (!p.startsWith("\\}")) return p.fail(error.InvalidPattern, save, "unterminated or malformed \\{...\\}");
         p.pos += 2;
-        if (lo == null and !(has_comma and hi != null))
+        if (lo == null and !has_comma)
             return p.fail(error.InvalidPattern, save, "malformed \\{...\\}");
         const min = lo orelse 0;
         const max: ?u32 = if (has_comma) hi else min;
@@ -776,9 +786,11 @@ const Parser = struct {
     };
 
     fn finishGroup(p: *Parser, open: usize, kind: GroupKind, saved: Flags) Error!*const Node {
+        p.open_groups += 1;
         const sub = try p.parseAlt();
         p.flags = saved;
         if (!p.eatGroupClose()) return p.fail(error.InvalidPattern, open, "unterminated group");
+        p.open_groups -= 1;
         return switch (kind) {
             .plain => p.node(.{ .group = .{ .sub = sub, .index = null } }),
             .capture => |i| p.node(.{ .group = .{ .sub = sub, .index = i } }),
