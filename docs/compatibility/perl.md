@@ -48,10 +48,12 @@ variable-length look-behind, conditionals, recursion, callouts. Without
 - **Nested classes in `.perl`.** `[a[bc]]` is the union of `a`, `b`, `c`
   (Oniguruma syntax). Perl reads the class `[a[bc]` followed by a literal `]`.
   One consequence: Perl accepts `[[:]`, which is an unterminated class here.
-- **Lazy loops that can match empty.** For a repeated group containing a lazy
-  part that can match empty, the default engine can choose a different match
-  from Perl: `(\w{0,2}?)+b` on `cbb` gives `0..3`, Perl `0..2`; likewise
-  `c(b|.{0,2}?)*` on `cbc`. `engine = .backtrack` gives Perl's result
+- **Repeats that prefer to match nothing.** When, inside a repeated group, a way
+  of matching nothing has priority over a way of consuming input, the default
+  engine can choose a longer match than Perl: `(?:b?|a)*` on `ba` gives `0..2`
+  (Perl `0..1`), and `(\w{0,2}?)+b` on `cbb` gives `0..3` (Perl `0..2`).
+  Putting the alternative that can be empty last avoids the first form.
+  `engine = .backtrack` gives Perl's result
   (`docs/decisions/0002-matching-engines.md`, section 4).
 - **Captures Perl keeps after backtracking.** In some patterns with forward or
   self references Perl matches using a capture left over from an abandoned

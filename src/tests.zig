@@ -1086,11 +1086,14 @@ test "differential: utf8 patterns agree between the DFA and the Pike VM" {
 
 test "the DFA cache stays bounded, flushes, and falls back when it is too small" {
     // "The seventh byte from the end is an a" needs a DFA state for each
-    // combination of the last seven bytes, in both directions.
-    const pattern = "[ab]*a[ab]{6}c";
+    // combination of the last seven bytes. The pattern asks it from both ends,
+    // so the forward and the reverse DFA both build many states.
+    const pattern = "[ab]{6}a[ab]*a[ab]{6}c";
     var prng = std.Random.DefaultPrng.init(0xcac4e);
     var hay: [600]u8 = undefined;
-    for (&hay) |*c| c.* = "ab"[prng.random().uintLessThan(usize, 2)];
+    // u32, not usize: the text, and so what the test exercises, must be the
+    // same on 32-bit targets.
+    for (&hay) |*c| c.* = "ab"[prng.random().uintLessThan(u32, 2)];
     // A match now and then, so that searches end at many places.
     var at: usize = 40;
     while (at < hay.len) : (at += 97) hay[at] = 'c';
@@ -1916,6 +1919,8 @@ test "Match.group is null for a group the pattern does not have, on every engine
 }
 
 test "the Pike VM forgets failed assertions when the first-byte skip moves on" {
+    // Found by the DFA/Pike differential test's inputs on a 32-bit target.
+    try expectSameEngines("(?:c?)^[ab]", .{ .dialect = .oniguruma }, .pike, .dfa, false, "acc\nb");
     // Perl and GNU grep find these; the Pike VM used to miss them.
     for ([_]regex.Engine{ .auto, .dfa, .pike, .backtrack }) |engine| {
         try expectSpanOpts("(?:\\bx)*\\by", "xz y", .{ 3, 4 }, .{ .engine = engine });
@@ -2159,11 +2164,16 @@ test "regex set: diagnostics name the pattern at fault, or the whole set" {
 
 // A known difference, not a wanted one (ADR 0002, section 4). If a change makes
 // the engines agree, update the ADR and perl.md and turn this into a check that
-// all engines give Perl's 0..2.
-test "known deviation: a lazy loop body that can match empty" {
-    const p = "(\\w{0,2}?)+b";
-    try expectSpanOpts(p, "cbb", .{ 0, 2 }, .{ .engine = .backtrack });
-    try expectSpanOpts(p, "cbb", .{ 0, 3 }, .{ .engine = .pike });
+// all engines give Perl's spans, which are the backtracker's below.
+test "known deviation: a repeat body that prefers to match nothing" {
+    for ([_]struct { pattern: []const u8, hay: []const u8, perl: [2]usize, linear: [2]usize }{
+        .{ .pattern = "(?:b?|a)*", .hay = "ba", .perl = .{ 0, 1 }, .linear = .{ 0, 2 } },
+        .{ .pattern = "(\\w{0,2}?)+b", .hay = "cbb", .perl = .{ 0, 2 }, .linear = .{ 0, 3 } },
+    }) |c| {
+        try expectSpanOpts(c.pattern, c.hay, c.perl, .{ .engine = .backtrack });
+        try expectSpanOpts(c.pattern, c.hay, c.linear, .{ .engine = .pike });
+        try expectSpanOpts(c.pattern, c.hay, c.linear, .{ .engine = .dfa });
+    }
 }
 
 /// Random patterns using what only the backtracker implements, including

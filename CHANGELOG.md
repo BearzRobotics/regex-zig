@@ -40,7 +40,7 @@ Bug-fix release from an audit of 0.4.0. **Some patterns now behave differently o
 - Corrected: the empty-match iteration rule is not the Rust crate's; the linear-time bound is per search; compatibility pages and module comments that described older releases.
 
 ### Known limitations
-- For a repeated group containing a lazy part that can match empty, the Pike VM and DFA can choose a different match from Perl and the backtracker (`(\w{0,2}?)+b` on `cbb`). `engine = .backtrack` gives Perl's result.
+- Inside a repeated group, if a way of matching nothing has priority over a way of consuming input, the Pike VM and DFA can choose a longer match than Perl and the backtracker: `(?:b?|a)*` on `ba` gives `0..2` instead of `0..1`; lazy parts do this too (`(\w{0,2}?)+b` on `cbb`). `engine = .backtrack` gives Perl's result. This is not new in 0.5.0.
 - Iterating over all matches can take quadratic time.
 
 ### License
