@@ -48,6 +48,7 @@ A large pattern may exceed `max_program_len` in this form (for example `\p{L}{10
 
 ## 5. Resource use
 
+- **Per search, not per iteration.** "Linear" describes one `find`. Iterating over all matches repeats it, and a search may need the rest of the input to confirm a short match, so `count` or `replaceAll` can be quadratic (`a.*b|a` on a run of `a`s: 80,000 bytes took about 6 s).
 - Pike VM memory: two thread lists, each with a capture array per instruction: about `2 × t × (2g + 2) × 8` bytes for `t` instructions that can hold a thread (byte-consuming ones and `match`) and `g` groups, allocated once per `Searcher`. This grows with the product, so it is capped by `Limits.max_capture_bytes` (64 MiB by default), checked at compile time.
 - No allocation during a search. The explicit stack used for the closure is bounded by the instruction count and reused.
 - The step budget does not apply to the Pike VM, because its work is bounded by input size.

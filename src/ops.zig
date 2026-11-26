@@ -34,6 +34,13 @@ pub fn isMatch(s: *Searcher, hay: []const u8) MatchError!bool {
 
 /// Iterates over successive, non-overlapping matches. Each Match borrows the
 /// searcher's registers and is valid until the next call to `next`.
+///
+/// The linear-time guarantee is per `find`, and each step of the iteration is a
+/// new one. A `find` may read to the end of the text to be sure of a short
+/// match (`a.*b|a` on a run of `a`s), so walking all matches, with `count`,
+/// `findAll`, `split` or `replaceAll`, can take time quadratic in the length of
+/// the text. No limit applies to this with the DFA or Pike VM; bound the input
+/// when both the pattern and the text are untrusted.
 pub const Matches = struct {
     searcher: *Searcher,
     hay: []const u8,
