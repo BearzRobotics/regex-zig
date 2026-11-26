@@ -18,6 +18,11 @@ pub fn build(b: *std.Build) void {
     ) orelse true;
     const options = b.addOptions();
     options.addOption(bool, "unicode_tables", unicode_tables);
+    // One build can hold two releases of this library (a program and one of
+    // its dependencies pinning different ones). Zig names the generated options
+    // file after its contents and refuses one file in two modules, so the
+    // contents must differ between releases.
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
 
     // The library module, importable by consumers as @import("regex").
     const mod = b.addModule("regex", .{

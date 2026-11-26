@@ -20,6 +20,9 @@ Bug-fix release from an audit of 0.4.0. **Some patterns now behave differently o
 - POSIX `isMatch` on the backtracker no longer searches for the longest match, which could hit the step limit on matching input.
 - `max_depth` counted tree levels in the compiler, so `(x(x(...` failed at half the documented depth. The parser now counts each branch in full.
 
+### Fixed: building
+- 0.5.0 can be in the same build as another release of this library, for example when a program upgrades before a dependency that still pins 0.4.0. Two releases with the same build options used to fail with "file exists in modules 'build_options0' and 'build_options1'"; the options now include the version.
+
 ### Behaviour changes
 - **POSIX BRE/ERE brackets:** `[` and `&&` are ordinary members, and a range may end at `[`. Some patterns that used to match differently now match as GNU grep does.
 - **Collating symbols** `[[.x.]]` and `[[=x=]]` (POSIX and Perl) are errors instead of being read as nested classes.
