@@ -14,6 +14,12 @@ pub const unset = std.math.maxInt(usize);
 /// instead (see ADR 0001, section 10).
 const max_inline_sequences = 16;
 
+/// Bounds the compiler's own work. A counted repeat compiles its body once per
+/// copy, and a body can hold many nodes that emit nothing, so the limit on
+/// emitted instructions does not by itself bound compile time.
+const work_per_instruction = 16;
+const min_work = 1 << 18;
+
 pub const Inst = union(enum) {
     byte: u8,
     any, // any byte except '\n'
@@ -138,6 +144,8 @@ const Compiler = struct {
     /// Compile the pattern right to left (the DFA that finds match starts).
     reverse: bool = false,
     depth: u32 = 0,
+    /// AST nodes compiled so far, counting every copy.
+    work: usize = 0,
     diag: *parse.Diagnostic,
 
     fn emit(c: *Compiler, i: Inst) parse.Error!u32 {
@@ -163,6 +171,11 @@ const Compiler = struct {
         defer c.depth -= 1;
         if (c.depth > c.limits.max_depth) {
             c.diag.* = .{ .pos = 0, .message = "pattern nesting too deep" };
+            return error.LimitExceeded;
+        }
+        c.work += 1;
+        if (c.work > @max(c.limits.max_program_len *| work_per_instruction, min_work)) {
+            c.diag.* = .{ .pos = 0, .message = "pattern expands to too much compile work" };
             return error.LimitExceeded;
         }
         switch (n.*) {
@@ -411,7 +424,13 @@ const Compiler = struct {
     fn compileRepeatBody(c: *Compiler, r: ast.Repeat) parse.Error!void {
         const lazy = r.greed == .lazy;
         var i: u32 = 0;
-        while (i < r.min) : (i += 1) try c.compile(r.sub);
+        while (i < r.min) : (i += 1) {
+            const before = c.here();
+            try c.compile(r.sub);
+            // A body that emits nothing, such as `(?:)` or `x{0}`, emits
+            // nothing every time. Nested, such repeats would multiply.
+            if (c.here() == before) break;
+        }
 
         if (r.max) |max| {
             // (x(x(x)?)?)? — every optional copy exits to the same end.

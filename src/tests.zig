@@ -1718,3 +1718,22 @@ test "the Pike VM forgets failed assertions when the first-byte skip moves on" {
     try expectSameEngines("x?\\bx*\\s", .{}, .pike, .backtrack, true, "\ncxybbc\ncaba");
     try expectSameEngines("x?\\bz", .{ .dialect = .posix_ere }, .pike, .backtrack, false, "xb zc\nx y\nzc\n\n");
 }
+
+test "limits: repeats of a body that emits nothing compile at once" {
+    // Five levels would be 1000^5 copies.
+    try expectSpan("(?:(?:(?:(?:(?:){1000}){1000}){1000}){1000}){1000}x", "ax", .{ 1, 2 });
+    try expectSpan("(?:(?:(?:(?:y{0}){1000}){1000}){1000}){1000}x", "yx", .{ 1, 2 });
+}
+
+test "limits: compile work is bounded when copies emit little" {
+    // One instruction and many nodes that emit nothing, copied 100,000 times.
+    const empties = try repeated("(?:)", 2000);
+    defer gpa.free(empties);
+    const pattern = try std.mem.concat(gpa, u8, &.{ "(?:(?:a", empties, "){1000}){100}" });
+    defer gpa.free(pattern);
+    var diag: regex.Diagnostic = .{};
+    try std.testing.expectError(error.LimitExceeded, regex.Regex.compile(gpa, pattern, .{}, &diag));
+    // Ordinary large patterns stay well inside the bound.
+    var re = try regex.Regex.compile(gpa, "(?:(?:(?:ab)(?:c|d)){1000}){10}", .{}, null);
+    re.deinit(gpa);
+}
