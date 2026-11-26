@@ -110,15 +110,15 @@ pub const RegexSet = struct {
     all: Regex,
     each: []Regex,
 
-    /// `diag.pattern` is the index of the pattern a failure is in.
+    /// `diag.pattern` is the index of the pattern a failure is in, or
+    /// `patterns.len` when no single pattern is at fault: the combined program
+    /// exceeds a limit.
     pub fn compile(gpa: std.mem.Allocator, patterns: []const []const u8, options: Options, diag: ?*Diagnostic) Error!RegexSet {
         var scratch: Diagnostic = .{};
         const d = diag orelse &scratch;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const parsed = try parse.parseSet(arena_state.allocator(), gpa, patterns, options.dialect, options.ignore_case, options.utf8, options.limits, d);
-        var all = try Regex.compileParsed(gpa, parsed, options, d);
-        errdefer all.deinit(gpa);
         const each = try gpa.alloc(Regex, patterns.len);
         var done: usize = 0;
         errdefer {
@@ -132,6 +132,11 @@ pub const RegexSet = struct {
             };
             done = i + 1;
         }
+        // Last, so that a pattern which fails on its own has been blamed.
+        const all = Regex.compileParsed(gpa, parsed, options, d) catch |e| {
+            d.pattern = patterns.len;
+            return e;
+        };
         return .{ .all = all, .each = each };
     }
 

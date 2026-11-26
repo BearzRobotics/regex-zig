@@ -84,7 +84,8 @@ pub const Error = error{
 pub const Diagnostic = struct {
     pos: usize = 0,
     message: []const u8 = "",
-    /// For a set of patterns: which one the problem is in.
+    /// For a set of patterns: which one the problem is in, or the number of
+    /// patterns when it is the set as a whole.
     pattern: usize = 0,
 };
 
@@ -1497,7 +1498,8 @@ pub fn parseSet(
             return e;
         };
         const stripped = stripCaptures(arena, one.root) catch |e| {
-            diag.* = .{ .pos = 0, .message = "back-references are not supported in a set", .pattern = i };
+            if (e == error.Unsupported)
+                diag.* = .{ .pos = 0, .message = "back-references are not supported in a set", .pattern = i };
             return e;
         };
         try alts.append(arena, stripped);

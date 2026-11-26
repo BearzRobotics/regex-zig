@@ -1971,3 +1971,15 @@ test "limits: the parser guards its own recursion" {
     try std.testing.expectError(error.LimitExceeded, regex.Regex.compile(gpa, deep, .{}, &diag));
     try std.testing.expectEqual(@as(usize, 199), diag.pos - 1);
 }
+
+test "regex set: diagnostics name the pattern at fault, or the whole set" {
+    var diag: regex.Diagnostic = .{};
+    const limits: regex.Options = .{ .limits = .{ .max_program_len = 1000 } };
+    // Each fits alone; together they do not.
+    try std.testing.expectError(error.LimitExceeded, regex.RegexSet.compile(gpa, &.{ "a", "b{900}", "c{900}" }, limits, &diag));
+    try std.testing.expectEqual(@as(usize, 3), diag.pattern);
+    try std.testing.expect(diag.message.len > 0);
+    // One is too large by itself.
+    try std.testing.expectError(error.LimitExceeded, regex.RegexSet.compile(gpa, &.{ "a", "(?:b{900}){2}", "c" }, limits, &diag));
+    try std.testing.expectEqual(@as(usize, 1), diag.pattern);
+}
