@@ -1094,12 +1094,17 @@ const Parser = struct {
                         try p.classUnion(&cls, pc);
                         continue;
                     }
+                    if (p.posix()) return p.fail(error.InvalidPattern, p.pos, "unterminated [: in a bracket expression");
                 }
-                p.pos += 1;
-                try p.classUnion(&cls, try p.parseClass());
-                continue;
+                try p.rejectCollating();
+                // A nested class. POSIX has none: there '[' is a member.
+                if (!p.posix()) {
+                    p.pos += 1;
+                    try p.classUnion(&cls, try p.parseClass());
+                    continue;
+                }
             }
-            if (c == '&' and p.startsWith("&&"))
+            if (c == '&' and !p.posix() and p.startsWith("&&"))
                 return p.fail(error.Unsupported, p.pos, "class intersection &&");
 
             const lo = (try p.classItem(&cls)) orelse continue;
@@ -1108,7 +1113,11 @@ const Parser = struct {
                 const save = p.pos;
                 p.pos += 1;
                 const nxt = p.peek().?;
-                if (nxt == '[') {
+                if (nxt == '[' and p.posix()) {
+                    // The range ends at '[', unless a [. or [= element starts.
+                    try p.rejectCollating();
+                    if (p.startsWith("[:")) return p.fail(error.InvalidPattern, save, "a character class cannot end a range");
+                } else if (nxt == '[') {
                     p.pos = save; // '-' followed by a nested class: literal '-'
                     try p.classAddCp(&cls, lo);
                     continue;
@@ -1126,6 +1135,20 @@ const Parser = struct {
             } else try p.classAddCp(&cls, lo);
         }
         return cls;
+    }
+
+    /// At a '[' inside a class: reports a collating symbol `[.x.]` or an
+    /// equivalence class `[=x=]`, which are not supported, instead of reading
+    /// it as something else. The Rust and Oniguruma syntaxes nest classes, so
+    /// there these are ordinary nested classes.
+    fn rejectCollating(p: *Parser) Error!void {
+        if (p.dialect == .rust or p.dialect == .oniguruma) return;
+        for ([_][2][]const u8{ .{ "[.", ".]" }, .{ "[=", "=]" } }) |pair| {
+            if (!p.startsWith(pair[0])) continue;
+            if (std.mem.indexOfPos(u8, p.src, p.pos + 2, pair[1]) != null)
+                return p.fail(error.Unsupported, p.pos, "collating symbols [. .] and equivalence classes [= =] are not supported");
+            if (p.posix()) return p.fail(error.InvalidPattern, p.pos, "unterminated [. or [= in a bracket expression");
+        }
     }
 
     /// One element inside a class. Returns the scalar (or byte) for a single
@@ -1199,6 +1222,8 @@ const Parser = struct {
         var name = p.src[start + 2 .. end];
         const neg = name.len > 0 and name[0] == '^';
         if (neg) name = name[1..];
+        // Only letters can be a class name; anything else is not this syntax.
+        for (name) |ch| if (!std.ascii.isAlphabetic(ch)) return null;
         if (p.utf8 and unicode.enabled) if (try p.posixUnicodeClass(name, neg)) |cls| {
             p.pos = end + 2;
             return cls;

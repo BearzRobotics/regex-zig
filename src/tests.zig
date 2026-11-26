@@ -1809,3 +1809,30 @@ test "posix: the yes/no question does not search for the longest match" {
         try std.testing.expectEqual(hay.len, (try s.find(hay, 0)).?.end());
     }
 }
+
+test "posix bracket expressions: '[' and '&&' are ordinary members" {
+    for ([_]regex.Dialect{ .posix_ere, .posix_bre }) |dialect| {
+        const o: regex.Options = .{ .dialect = dialect };
+        // All of these follow GNU grep 3.12.
+        try expectSpanOpts("[[]", "a[b", .{ 1, 2 }, o);
+        try expectSpanOpts("[a[]", "x[y", .{ 1, 2 }, o);
+        try expectSpanOpts("^[[]a]$", "[a]", .{ 0, 3 }, o);
+        try expectSpanOpts("^[[ab]]$", "a]", .{ 0, 2 }, o);
+        try expectSpanOpts("[[ab]]", "a", null, o);
+        try expectSpanOpts("[][]", "[", .{ 0, 1 }, o);
+        try expectSpanOpts("[^[]", "[a", .{ 1, 2 }, o);
+        try expectSpanOpts("[+-[]", "0", .{ 0, 1 }, o);
+        try expectSpanOpts("[+-[]", "a", null, o);
+        try expectSpanOpts("[a&&b]", "&", .{ 0, 1 }, o);
+        try expectSpanOpts("[&&]", "x&", .{ 1, 2 }, o);
+        try expectSpanOpts("[.a.]", ".", .{ 0, 1 }, o); // an ordinary class
+        for ([_][]const u8{ "[[.a.]]", "[[=a=]]", "[a[.-.]]", "[a-[.z.]]" }) |p|
+            try expectCompileError(p, o, error.Unsupported);
+        for ([_][]const u8{ "[[:]", "x[[.]y", "[[=]", "[a-[:digit:]]" }) |p|
+            try expectCompileError(p, o, error.InvalidPattern);
+    }
+    // The other dialects keep nested classes; .perl no longer misreads [. .].
+    try expectSpan("[a[bc]]+", "xbcax", .{ 1, 4 });
+    try expectCompileError("[[.a.]]", .{}, error.Unsupported);
+    try expectSpanOpts("[[.a.]]", ".", .{ 0, 1 }, .{ .dialect = .rust });
+}
