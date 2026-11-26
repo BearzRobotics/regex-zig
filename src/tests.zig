@@ -1078,22 +1078,71 @@ test "differential: utf8 patterns agree between the DFA and the Pike VM" {
     try expectCompileError("\\b\\w+", .{ .utf8 = true, .engine = .dfa }, error.Unsupported);
 }
 
-test "the DFA falls back when its cache is too small" {
-    // Many distinct states with a tiny cache: the answer must still be right.
-    const hay = try repeated("abcabcabd", 2000);
-    defer gpa.free(hay);
-    const opts: regex.Options = .{ .engine = .dfa, .limits = .{ .max_dfa_cache = 2000 } };
-    var re = try regex.Regex.compile(gpa, "(a|b|c)*abd(a|b|c|d){5}x", opts, null);
-    defer re.deinit(gpa);
-    var s = try re.searcher(gpa);
-    defer s.deinit();
-    try std.testing.expect((try s.find(hay, 0)) == null);
-    try std.testing.expect(!(try s.isMatch(hay)));
-    const hay2 = try std.mem.concat(gpa, u8, &.{ hay, "abdabcdax" });
-    defer gpa.free(hay2);
-    try std.testing.expect(try s.isMatch(hay2));
-    const m = (try s.find(hay2, 0)).?;
-    try std.testing.expectEqual(hay2.len, m.end());
+test "the DFA cache stays bounded, flushes, and falls back when it is too small" {
+    // "The seventh byte from the end is an a" needs a DFA state for each
+    // combination of the last seven bytes, in both directions.
+    const pattern = "[ab]*a[ab]{6}c";
+    var prng = std.Random.DefaultPrng.init(0xcac4e);
+    var hay: [600]u8 = undefined;
+    for (&hay) |*c| c.* = "ab"[prng.random().uintLessThan(usize, 2)];
+    // A match now and then, so that searches end at many places.
+    var at: usize = 40;
+    while (at < hay.len) : (at += 97) hay[at] = 'c';
+
+    var pike = try regex.Regex.compile(gpa, pattern, .{ .engine = .pike }, null);
+    defer pike.deinit(gpa);
+    var ps = try pike.searcher(gpa);
+    defer ps.deinit();
+
+    var seen: struct { fwd_flush: bool = false, rev_flush: bool = false, gave_up: bool = false, recovered: bool = false } = .{};
+    var size: usize = 0;
+    while (size <= 24_000) : (size += 400) {
+        const opts: regex.Options = .{ .engine = .dfa, .limits = .{ .max_dfa_cache = size } };
+        var re = try regex.Regex.compile(gpa, pattern, opts, null);
+        defer re.deinit(gpa);
+        var s = try re.searcher(gpa);
+        defer s.deinit();
+        var from: usize = 0;
+        while (from < hay.len) : (from += 83) {
+            // Short haystacks too: the last of them has no match.
+            for ([_]usize{ hay.len, @min(hay.len, from + 30) }) |end| {
+                const want = try ps.find(hay[0..end], from);
+                const wanted: ?[2]usize = if (want) |m| .{ m.start(), m.end() } else null;
+                const got = try s.find(hay[0..end], from);
+                try std.testing.expectEqual(wanted, if (got) |m| @as(?[2]usize, .{ m.start(), m.end() }) else null);
+                const f = &s.fwd.?;
+                if (f.search_flushes > 4) seen.gave_up = true;
+                if (f.search_flushes > 0 and f.search_flushes <= 4) seen.recovered = true;
+                try std.testing.expectEqual(try ps.isMatch(hay[from..end]), try s.isMatch(hay[from..end]));
+            }
+        }
+        for ([_]*const @TypeOf(s.fwd.?){ &s.fwd.?, &s.rev.? }) |d| {
+            // A single state may exceed a tiny cache; nothing else may.
+            try std.testing.expect(d.used <= @max(size, 1024));
+        }
+        if (s.fwd.?.epoch > 0) seen.fwd_flush = true;
+        if (s.rev.?.epoch > 0) seen.rev_flush = true;
+    }
+    // Without these the test would prove nothing about the cache.
+    try std.testing.expect(seen.fwd_flush);
+    try std.testing.expect(seen.rev_flush);
+    try std.testing.expect(seen.gave_up);
+    try std.testing.expect(seen.recovered);
+}
+
+test "the DFA drops a transition computed across a flush" {
+    // With room for about one state, a flush renumbers the states while a
+    // transition is being built. Runs of one byte would then follow a
+    // transition recorded against the wrong state.
+    for ([_][]const u8{ "a{3}b", "aab|a{5}c", "(?:ab){3}", "x[ab]{4}c" }) |pattern| {
+        for ([_][]const u8{ "aaab", "aaaaaaab", "aaaaac", "aaaab aab", "abababab", "xaaaac xbbbbc", "aaaaaaaa" }) |hay| {
+            var size: usize = 0;
+            while (size <= 1600) : (size += 16) {
+                const opts: regex.Options = .{ .limits = .{ .max_dfa_cache = size } };
+                try expectSameEngines(pattern, opts, .dfa, .pike, true, hay);
+            }
+        }
+    }
 }
 
 test "the DFA treats a final newline like the other engines" {
