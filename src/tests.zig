@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
-//! Behaviour tests for the parser and the backtracking engine. Expected
-//! results follow Perl/PCRE and Oniguruma semantics as documented in
-//! docs/compatibility/perl.md.
+//! Behaviour, differential, reference, fuzz, limit and allocation-failure
+//! tests for the parser and all engines. Expected results follow the dialect
+//! pages in docs/compatibility/.
 
 const std = @import("std");
 const regex = @import("root.zig");

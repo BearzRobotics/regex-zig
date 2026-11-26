@@ -1,6 +1,6 @@
 # Architecture
 
-How regex-zig is put together as of version 0.4.0. Design decisions and their reasons are in `docs/decisions/`; the requirements are in `SPEC.md`.
+How regex-zig is put together as of version 0.5.0. Design decisions and their reasons are in `docs/decisions/`; the requirements are in `SPEC.md`.
 
 ## Overview
 
@@ -58,7 +58,7 @@ How regex-zig is put together as of version 0.4.0. Design decisions and their re
 Decided once, in `program.compile`:
 
 1. Back-references, look-around, atomic groups or possessive quantifiers: **backtracker**. Its work is bounded by `Limits.max_steps` and `max_stack`, not by the input size.
-2. Otherwise the NFA program is built. If it would exceed `max_program_len` (for example `\p{L}{100}`), fall back to the backtracker.
+2. Otherwise the NFA program is built. If it would exceed `max_program_len` (for example `\p{L}{100}`), fall back to the backtracker; `Regex.isLinearTime` reports it. If the Pike VM's capture slots would exceed `max_capture_bytes`, compiling fails.
 3. If the pattern has no `\G` and no Unicode `\b \B \< \>`, the reverse NFA program is built too and the engine is **DFA**; otherwise **Pike VM**.
 
 `Options.engine` forces `.backtrack`, `.pike` or `.dfa` (an error if the pattern does not qualify), mainly for tests.
@@ -77,7 +77,9 @@ Decided once, in `program.compile`:
 | Resource | Bound |
 |---|---|
 | Pattern length, nesting, repeat count, program size | `Limits` (compile time, errors) |
-| Backtracker | `max_steps` per `find` call, `max_stack` frames |
+| Compiler work | 16 nodes per allowed instruction (at least 262,144), so repeats of bodies that emit little cannot run on |
+| Parse memory for classes | built in a scratch arena reset per class; one copy per distinct set |
+| Backtracker | `max_steps` per `find` call (a back-reference adds a step per 32 bytes compared), `max_stack` frames |
 | Pike VM | two thread lists of `t x (2g+2)` words (`t` = instructions that can hold a thread, `g` = groups), sized once and capped by `max_capture_bytes`; no allocation while searching |
 | Lazy DFA | `max_dfa_cache` bytes per direction; cleared when full, then falls back |
 | `Searcher` | all mutable state; one per thread; the `Regex` must outlive it |
@@ -88,4 +90,4 @@ A `Regex` (and `RegexSet`) is immutable after compile and can be shared. A `Sear
 
 ## Tests
 
-`zig build test` runs: parser and behaviour tests (each also checks the backtracker against the default engine), randomized differential tests (Pike vs backtracker, DFA vs Pike, over Perl, ERE, BRE and Oniguruma syntaxes), agreement with GNU grep 3.12 on generated BRE and ERE cases (`src/testdata/grep_cases.txt`), fuzzing with arbitrary pattern bytes, allocation-failure tests, and pathological-pattern tests. `zig build test -Dunicode_tables=false` covers the build without the tables.
+`zig build test` runs: parser and behaviour tests (each also checks the backtracker against the default engine), randomized differential tests (Pike vs backtracker, DFA vs Pike, over Perl, ERE, BRE and Oniguruma syntaxes), agreement with GNU grep 3.12 on lines and match spans for generated BRE and ERE cases, with and without `-i` (`src/testdata/grep_cases.txt`), fuzzing with arbitrary pattern bytes and with backtracker-only constructs, slice-against-stream line search, DFA cache flush and fallback tests, allocation-failure tests, limit and pathological-pattern tests. `zig build test -Dunicode_tables=false` covers the build without the tables.

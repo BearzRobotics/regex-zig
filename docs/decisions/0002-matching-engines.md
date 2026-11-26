@@ -79,7 +79,7 @@ Files: `src/dfa.zig`; `program.zig` (reverse compile, eligibility, literal prefi
 
 **Cache.** States and transitions are cached up to `Limits.max_dfa_cache` (2 MiB default) per direction. When full the cache is cleared; after four clears in one search the DFA gives up and that search runs on the Pike VM. Adding a state is atomic with respect to allocation failure (found by the allocation-failure test).
 
-**Prefilters.** When nothing is running and the pattern cannot match empty, the forward DFA skips to the next byte a match can start with (`memchr`-style for one byte), or, for a literal prefix of two or more bytes, to the next occurrence of the prefix with a substring search. No SIMD code of our own: this is `std.mem.indexOfScalarPos` and `indexOfPos`.
+**Prefilters.** When nothing is running and the pattern cannot match empty, the forward DFA skips to the next byte a match can start with (`memchr`-style for one byte), or, for a literal prefix of two or more bytes, to the next occurrence of the prefix with a substring search. One byte uses `std.mem.indexOfScalarPos`; since 0.4.0, two or three bytes and literal prefixes use vector scans of our own (`indexOfAny3`, `indexOfNeedle` in `dfa.zig`).
 
 **Results.** On `zig build bench` (same machine, MB/s): `[a-z]+` 21 (Pike only) to 121, email-like 15 to 232, utf8 `\p{L}+` 3 to 144, alternation of words 55 to 396, literal `the` 217 to 499. Captured groups still take the Pike VM (about 17 MB/s), and a leftmost-longest `find` too (about 47 MB/s); `isMatch` is the fast path for those.
 

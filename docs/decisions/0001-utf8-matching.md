@@ -132,7 +132,7 @@ Verification done while generating: the General_Category tables partition the 1,
 
 **New VM instruction (a change to §3.1).** A large set cannot be lowered to byte sequences without hundreds of alternatives per character: `\p{L}` would be tried against all of them one after another, in a backtracking VM that also spends a step per attempt. So a set that needs more than 16 byte sequences compiles to one `cp_class` instruction instead. It decodes one well-formed UTF-8 character (invalid, truncated, overlong, surrogate and out-of-range sequences all fail) and binary-searches the range list. Smaller sets, including `.` and `[^a]`, still lower to byte sequences. This is the §3.2 approach used only where §3.1 does not scale. Consequences:
 
-- Program size for `\p{L}+` is 12 instructions plus one shared range list (identical sets are shared when a repeat body is compiled several times).
+- Program size for `\p{L}+` is 12 instructions plus one shared range list (identical sets are shared; since 0.5.0 also between separate occurrences in a pattern).
 - A future lazy DFA must lower `cp_class` to byte automata itself. It can reuse `utf8.appendSequences`, so no work is lost.
 - The step budget counts one step per character for these classes. A test matches `\p{L}+` over 300,000 bytes of mixed text.
 

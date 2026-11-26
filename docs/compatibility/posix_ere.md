@@ -1,46 +1,48 @@
 # POSIX ERE dialect: compatibility record
 
-Status: partial, first slice (not verified against a reference engine).
-Date: 2026-11-13
+Applies to 0.5.0. Date: 2026-11-26.
 
-References: POSIX.1-2017, Base Definitions, chapter 9 "Regular Expressions"
-(Extended Regular Expressions), and the GNU regex extensions described in the
-glibc manual. Neither was consulted while writing this; the expected results in
-`src/tests.zig` come from the author's knowledge and are NOT differentially
-tested against `regcomp(REG_EXTENDED)` or GNU grep -E yet.
-
-First consumer: dkman (`apropos` / `whatis` patterns).
+Reference: GNU grep 3.12 `-E`, `LC_ALL=C`. The test suite checks which lines
+match **and where** (`grep -ob`) on 700 generated patterns, plus 200 with `-i`
+(`src/testdata/grep_cases.txt`, made by `tools/gen_grep_cases.py`). This is not
+a claim of full POSIX or GNU compliance; POSIX.1 itself was not consulted.
 
 ## Supported (`Options.dialect = .posix_ere`)
 
-- Literals, `.`, alternation, groups (all capturing), `* + ? {n} {n,} {n,m}`.
+- Literals, `.`, alternation, groups (all capturing), `* + ? {n} {n,} {n,m}`,
+  and as in GNU `{,m}` and `{,}`.
 - A quantifier may follow a quantifier: `a*?` is `(a*)?`; there are no lazy or
-  possessive forms. `(?` has no special meaning (`(?:a)` is an error: `?` has
-  nothing to repeat).
+  possessive forms. `(?` has no special meaning (`(?:a)` is an error).
+- A `)` with no group open is a literal. A `{` that is not a valid interval is
+  a literal.
 - `.` matches a newline; `^` and `$` anchor at the text boundaries (as without
   `REG_NEWLINE`).
-- Bracket expressions: ranges, negation, `[[:alpha:]]`-style classes; a
-  backslash inside brackets is a literal.
-- GNU escapes `\w \W \s \S \b \B` and back-references `\1`..`\9`.
-- Any other escape stands for the character itself (`\.`, `\d` is `d`).
+- Bracket expressions: ranges, negation, `[[:alpha:]]`-style classes. `[`,
+  `&&` and a backslash are ordinary members, and a range may end at `[`.
+- GNU escapes `\w \W \s \S \b \B \< \> \` \'` and back-references `\1`..`\9`.
+  Any other escape stands for the character itself (`\.`, `\d` is `d`, `\Q`
+  is `Q`).
+- With `Options.utf8`, `.`, brackets and negation use Unicode scalar values;
+  see `perl.md` for what becomes Unicode-aware.
 
-## Not supported
+## Matching rules and engines
 
-- `\<` and `\>` (word start/end): `error.Unsupported`.
-- Collating symbols and equivalence classes `[[.x.]]`, `[[=x=]]`.
-- Leftmost-longest matching. The engine is leftmost-first, so the *span* of a
-  match can differ from `regexec`; whether a match exists does not. A consumer
-  that only asks "does it match?" is unaffected.
-- POSIX BRE.
+- **Leftmost-longest** for the overall match: the leftmost start wins, then the
+  longest end (`a|ab` on `abc` matches `ab`). Sub-group positions follow thread
+  priority among matches of the same length, which is not the POSIX
+  subexpression rule.
+- Patterns without back-references run in time linear in the input per search;
+  patterns with them run on the backtracker, bounded by the step limit.
+  `isMatch` stops at the first match; `find` has to try the alternatives to
+  find the longest.
 
-## Matching rules and engines (version 0.2.0)
+## Differences from GNU grep
 
-- `.posix_ere` is **leftmost-longest** for the overall match: the leftmost start wins, then the longest end (`a|ab` on `abc` matches `ab`). Sub-group positions follow thread priority among matches of the same length, which is not the POSIX subexpression rule.
-- Patterns without back-references run on the Pike VM in time linear in the input; patterns with back-references run on the backtracker (still leftmost-longest, bounded by the step limit). See `docs/decisions/0002-matching-engines.md`.
-- `Options.utf8` works with this dialect: `.`, bracket expressions and negation use Unicode scalar values; `\w`, `\s` and the POSIX classes alpha, alnum, upper, lower, digit, space and blank are Unicode-aware; `(?i)` equivalents use simple case folding. See `perl.md` for the full list.
-
-## Changes in 0.3.0
-
-- `\<` and `\>` (word start and end), `` \` `` and `\'` (start and end of the text) are supported, as in GNU.
-- `$` is the end of the text, no longer "before a final newline".
-- Agreement with GNU grep 3.12 `-E` is tested on 700 generated patterns (`src/testdata/grep_cases.txt`, LC_ALL=C). One known difference: for a back-reference to a group that is repeated and can match empty, such as `b|((c?)){2}\1$`, GNU grep selects no line where regex-zig follows Perl semantics and does. The test lists it as a known deviation.
+- Collating symbols and equivalence classes `[[.x.]]`, `[[=x=]]` are reported
+  as unsupported.
+- grep rejects `[:alpha:]` written without outer brackets, and a `-` right
+  after a range (`[a-z-x]`); both are accepted here as ordinary classes.
+- `a{}` and a quantifier at the start of an expression are handled differently:
+  `a{}` is literal here (grep: error), `*a` is an error here (grep: warning).
+- For a back-reference to a group that is repeated and can match empty, such as
+  `b|((c?)){2}\1$`, GNU grep selects fewer lines; this library follows Perl.

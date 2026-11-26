@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
-//! Backtracking VM for patterns that need back-references, look-around,
-//! atomic groups or possessive quantifiers (SPEC §2.3). It uses an explicit,
-//! bounded stack instead of recursion, and a step budget, so hostile patterns
-//! produce an error instead of a crash or an unbounded run.
+//! `Searcher`, which runs a compiled program on whichever engine it was built
+//! for, and the backtracking VM for patterns that need back-references,
+//! look-around, atomic groups or possessive quantifiers (SPEC §2.3). The VM
+//! uses an explicit, bounded stack instead of recursion, and a step budget, so
+//! hostile patterns produce an error instead of a crash or an unbounded run.
 
 const std = @import("std");
 const program = @import("program.zig");

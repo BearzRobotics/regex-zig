@@ -39,6 +39,13 @@ zig build bench                         # benchmarks (ReleaseFast)
 
 Add it to another project with `zig fetch --save` and `b.dependency("regex", .{})`; pass `.unicode_tables = false` to leave the Unicode tables out.
 
+## Untrusted patterns and input
+
+`Options.limits` bounds pattern length, nesting, repeat counts, program size, compiler work, capture memory, the DFA cache, and the backtracker's steps and stack; exceeding one is an error. Two things are left to the caller:
+
+- If backtracking is not acceptable, refuse patterns for which `Regex.isLinearTime()` is false.
+- The linear-time bound is per search. Walking every match (`count`, `findAll`, `split`, `replaceAll`) can take quadratic time, so bound the input.
+
 ## Documentation
 
 - `docs/architecture.md` — how the pieces fit together.
@@ -49,15 +56,16 @@ Add it to another project with `zig fetch --save` and `b.dependency("regex", .{}
 
 ## Future work
 
-Not in 0.4.0; recorded as known limitations in `CHANGELOG.md`.
+Not in 0.5.0; recorded as known limitations in `CHANGELOG.md`.
 
-- SIMD prefilters and a required-substring prefilter.
+- A required-substring prefilter, and SIMD prefilters beyond the byte and prefix scans.
+- Perl's priority in lazy loops that can match empty, on the linear-time engines.
 - Aho-Corasick (or Teddy) for large literal sets in `RegexSet`.
 - Streaming beyond line-oriented input (matches across reader chunks).
 - Full Unicode case folding (ß to ss) and `\p{Script_Extensions}`.
 - POSIX subexpression rule for group positions in leftmost-longest mode.
 - Faster capture-group and leftmost-longest paths (currently the Pike VM).
-- Differential tests against ripgrep and the Rust `regex` crate.
+- Differential tests in the suite against ripgrep (or the Rust `regex` crate) and Perl.
 
 ## License
 

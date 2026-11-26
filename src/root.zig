@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 //! regex-zig: a pure-Zig regular-expression library (see SPEC.md).
 //!
-//! Current state: the Perl, Oniguruma and POSIX ERE parsers and the bounded
-//! backtracking engine, with isMatch/matches/count/findAll/split/replaceAll
-//! helpers on Searcher (ops.zig), and UTF-8 matching (Options.utf8) with Unicode
-//! properties and simple case folding (-Dunicode_tables=false leaves the
-//! tables out). POSIX BRE, the Rust dialect, the linear-time engine, full case
-//! folding and streaming are not implemented yet.
+//! Five syntaxes (Perl, Oniguruma, POSIX ERE and BRE, Rust); a lazy DFA and a
+//! Pike VM, linear per search, and a bounded backtracker for what they cannot
+//! run; pattern sets; isMatch/matches/count/findAll/split/replaceAll on
+//! Searcher (ops.zig); line search over memory or a `std.Io.Reader`; UTF-8
+//! matching (Options.utf8) with Unicode properties and simple case folding
+//! (-Dunicode_tables=false leaves the tables out). Full case folding and
+//! streaming of matches that span lines are not implemented.
+//!
+//! Untrusted patterns: `Limits` bounds compile time, program and capture
+//! memory and backtracking. Check `Regex.isLinearTime` if backtracking is not
+//! acceptable, and bound the input if you iterate over all matches.
 
 const std = @import("std");
 const parse = @import("parse.zig");

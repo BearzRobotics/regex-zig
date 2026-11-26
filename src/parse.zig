@@ -5,22 +5,21 @@
 //!                   (?m); (?s) lets `.` match '\n'; `\h` is horizontal space.
 //!   * .oniguruma  — Oniguruma "Ruby" flavour as used by Sublime syntaxes:
 //!                   `^`/`$` are always line anchors; (?m) lets `.` match '\n';
-//!                   `\h` is a hex digit; `{,n}` is accepted.
+//!                   `\h` is a hex digit.
 //!   * .posix_ere  — POSIX extended expressions with the GNU `\w \W \s \S \b \B`
 //!                   and back-references: `.` matches '\n', `^`/`$` are text
 //!                   anchors, a quantifier may follow a quantifier (`a*?` is
 //!                   `(a*)?`, never lazy), `(?` has no meaning, a backslash in
 //!                   a bracket expression is a literal, and any other escape
-//!                   stands for the character itself. Matching is still
-//!                   leftmost-first, so the span of a match may differ from a
-//!                   leftmost-longest engine; whether a match exists does not.
+//!                   stands for the character itself. Matching is
+//!                   leftmost-longest (decided by the engines).
 //!   * .rust       — the syntax of Rust's `regex` crate (as used by ripgrep):
 //!                   Perl-like groups, flags (i m s x U u) and escapes, `$` is
 //!                   the end of the text, and set operations in classes
 //!                   (`[a-z&&[^aeiou]]`, `--`, `~~`). No back-references,
 //!                   look-around, atomic groups, possessive quantifiers, `\Z`
-//!                   or `\G`: those are errors, so every pattern runs on the
-//!                   linear-time engines.
+//!                   or `\G`: those are errors, so nothing in this syntax needs
+//!                   the backtracker.
 //!   * .posix_bre  — POSIX basic expressions with the GNU extensions: `\( \)`
 //!                   groups, `\{m,n\}` intervals, `\+ \? \|`, `*` literal at the
 //!                   start of an expression or group, `^` and `$` anchors only

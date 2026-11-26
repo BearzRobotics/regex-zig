@@ -1,7 +1,49 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
+Bug-fix release from an audit of 0.4.0. **Some patterns now behave differently or are refused**; read "Behaviour changes" before upgrading.
+
+### Fixed: memory safety and crashes
+- A double free in the compiler when emitting a large Unicode class failed (program size limit or `OutOfMemory`); a 26-byte pattern reached it with default limits.
+- A back-reference inside its own group could underflow (panic in safe builds) or see a wrong capture.
+- `Match.group` with a group number the pattern does not have read out of bounds; it now returns null. `Match.regs` now holds only the capture pairs.
+
+### Fixed: wrong matches
+- The Pike VM missed matches after skipping ahead (for example `(\bx)*\by` on `xz y`). This affected the default engine for POSIX spans, captures and fallbacks.
+
+### Fixed: resource limits
+- Nested repeats of an empty body hung compilation (`(?:(?:(?:){1000}){1000}){1000}` took 12 s, one more level effectively forever). Compiler work is now bounded.
+- Pike VM memory grew with instructions x groups (8 KB pattern: 978 MB). Slots are reserved only where needed, under the new `Limits.max_capture_bytes` (64 MiB).
+- Repeated Unicode classes multiplied memory (32 KB pattern: 530 MB peak, now about 1 MB).
+- Back-references now cost a step per 32 bytes compared, so `max_steps` bounds time.
+- POSIX `isMatch` on the backtracker no longer searches for the longest match, which could hit the step limit on matching input.
+- `max_depth` counted tree levels in the compiler, so `(x(x(...` failed at half the documented depth. The parser now counts each branch in full.
+
+### Behaviour changes
+- **POSIX BRE/ERE brackets:** `[` and `&&` are ordinary members, and a range may end at `[`. Some patterns that used to match differently now match as GNU grep does.
+- **Collating symbols** `[[.x.]]` and `[[=x=]]` (POSIX and Perl) are errors instead of being read as nested classes.
+- **ERE:** `\Q` is a literal `Q`; `{,n}` and `{,}` are intervals; an unmatched `)` is a literal. **BRE:** `\{,\}` is accepted.
+- **Perl:** `{,n}` is a quantifier (it was literal text); comments may stand before a quantifier; `\10` and up are octal unless that many groups are open.
+- **Rust:** `\<` `\>` are word start and end (they were literal characters); `\b{start}` and `\b{end}` work; a stray `{`, `[a-\d]`, `[\b]` and duplicate group names are errors; under `(?i)` set operations fold their operands first.
+- **All:** group names may not start with a digit; `\x{+41}` and the templates `${+1}`, `${1_0}`, `${-0}` are errors.
+- **`RegexSet.compile`:** `diag.pattern == patterns.len` when the set as a whole exceeds a limit (it was 0).
+
+### Added
+- `Regex.isLinearTime()` and `RegexSet.isLinearTime()`.
+- `Limits.max_capture_bytes`.
+
+### Tests
+- The DFA cache tests now really flush and fall back; the Pike/backtracker and DFA tests use a wider alphabet; new random tests for backtracker-only constructs and slice-against-stream search; strict allocation-failure tests; GNU grep agreement now checks match spans, `-i` and more bracket syntax (1,800 patterns).
+
+### Documentation
+- Corrected: the empty-match iteration rule is not the Rust crate's; the linear-time bound is per search; compatibility pages and module comments that described older releases.
+
+### Known limitations
+- For a repeated group containing a lazy part that can match empty, the Pike VM and DFA can choose a different match from Perl and the backtracker (`(\w{0,2}?)+b` on `cbb`). `engine = .backtrack` gives Perl's result.
+- Iterating over all matches can take quadratic time.
+
+### License
 - regex-zig is licensed under `LGPL-2.0-or-later`. The `LICENSE` file is new and is part of the package.
 
 ## 0.4.0
