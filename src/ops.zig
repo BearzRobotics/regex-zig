@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Convenience operations built on Searcher.find: iteration, counting,
 //! replacement and splitting. They are re-exported as Searcher methods.
 //!

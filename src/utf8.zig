@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Code-point ranges and their lowering to UTF-8 byte sequences (ADR 0001).
 //!
 //! In `utf8` mode a character class is a sorted list of Unicode scalar value

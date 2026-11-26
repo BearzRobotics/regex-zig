@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! regex-zig: a pure-Zig regular-expression library (see SPEC.md).
 //!
 //! Current state: the Perl, Oniguruma and POSIX ERE parsers and the bounded

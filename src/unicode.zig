@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Unicode property lookup over the generated tables in unicode_tables.zig.
 //!
 //! A table is a flat, sorted list of inclusive (lo, hi) scalar-value pairs.

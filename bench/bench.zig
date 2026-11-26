@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Benchmarks (`zig build bench`, always built with ReleaseFast).
 //!
 //! Each case runs a pattern over a generated haystack several times and

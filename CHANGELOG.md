@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- regex-zig is licensed under `LGPL-2.0-or-later`. The `LICENSE` file is new and is part of the package.
+
 ## 0.4.0
 
 Performance release: the lazy DFA's hot loop, found expensive by util-core's grep benchmarks (callgrind: about 64 instructions per byte).

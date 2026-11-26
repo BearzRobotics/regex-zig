@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Pike VM: runs the NFA program (program.zig, `Nfa`) over the haystack one
 //! byte at a time, keeping every live thread, so the work is bounded by
 //! (program size) x (input size) whatever the pattern. See

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Lazy DFA over the NFA program (program.zig, `Nfa`). It answers "where does
 //! a match end" (forward, unanchored) and "where does it start" (the same
 //! pattern compiled right to left, anchored at the end), in time linear in

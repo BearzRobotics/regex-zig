@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Parser for the Perl-style syntax family. Five dialects share one parser:
 //!
 //!   * .perl       — Perl/PCRE flavour: `^`/`$` match at text boundaries unless

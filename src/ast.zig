@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Syntax-independent regular-expression AST. Every parser produces this tree
 //! and the compiler consumes it, so engines never see syntax details.
 //!

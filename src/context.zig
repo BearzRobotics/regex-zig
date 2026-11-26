@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Context checks shared by the matching engines: empty-width assertions and
 //! UTF-8 decoding around a position. They look at the whole haystack, so
 //! they behave the same in every engine.

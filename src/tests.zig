@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Behaviour tests for the parser and the backtracking engine. Expected
 //! results follow Perl/PCRE and Oniguruma semantics as documented in
 //! docs/compatibility/perl.md.

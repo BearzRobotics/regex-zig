@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Line-oriented streaming search over a `std.Io.Reader` (grep-style).
 //!
 //! Streaming semantics (SPEC section 9, decision 6): a pattern is matched

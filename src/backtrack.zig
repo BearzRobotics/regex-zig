@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Backtracking VM for patterns that need back-references, look-around,
 //! atomic groups or possessive quantifiers (SPEC §2.3). It uses an explicit,
 //! bounded stack instead of recursion, and a step budget, so hostile patterns

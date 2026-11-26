@@ -58,3 +58,14 @@ Not in 0.4.0; recorded as known limitations in `CHANGELOG.md`.
 - POSIX subexpression rule for group positions in leftmost-longest mode.
 - Faster capture-group and leftmost-longest paths (currently the Pike VM).
 - Differential tests against ripgrep and the Rust `regex` crate.
+
+## License
+
+Copyright (c) 2026 Dakota James Owen Keeler.
+
+regex-zig is free software under the GNU Library General Public License, version 2
+or (at your option) any later version (`LGPL-2.0-or-later`). It comes with no
+warranty. See `LICENSE`.
+
+`src/unicode_tables.zig` is generated from the Unicode Character Database and
+keeps the Unicode License.

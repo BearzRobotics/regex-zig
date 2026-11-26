@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! A set of byte values, stored as a 256-bit bitmap.
 
 const std = @import("std");

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! Compiled program for the backtracking VM, and the compiler from the AST.
 
 const std = @import("std");

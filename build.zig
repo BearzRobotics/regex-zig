@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
 //! regex-zig build script. `zig build test` runs all unit tests.
 
 const std = @import("std");
