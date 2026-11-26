@@ -259,18 +259,19 @@ const Compiler = struct {
     /// utf8.zig). The sequences are disjoint, so their order does not matter.
     fn emitRanges(c: *Compiler, ranges: []const utf8.CpRange) parse.Error!void {
         if (c.nfa) return c.emitRangesNfa(ranges);
+        // A large set seen before: no need to lower it again.
+        for (c.cp_sources.items, 0..) |src, k| {
+            if (src.ptr == ranges.ptr and src.len == ranges.len) {
+                _ = try c.emit(.{ .cp_class = @intCast(k) });
+                return;
+            }
+        }
         var seqs: std.ArrayList(utf8.Sequence) = .empty;
         defer seqs.deinit(c.gpa);
         for (ranges) |r| try utf8.appendSequences(c.gpa, &seqs, r);
         if (seqs.items.len > max_inline_sequences) {
             // Trying hundreds of alternatives per character would be slow;
             // decode the character once and binary-search the ranges instead.
-            for (c.cp_sources.items, 0..) |src, k| {
-                if (src.ptr == ranges.ptr and src.len == ranges.len) {
-                    _ = try c.emit(.{ .cp_class = @intCast(k) });
-                    return;
-                }
-            }
             const copy = try c.gpa.dupe(utf8.CpRange, ranges);
             {
                 // Only until `cp_sets` owns the copy: after that `build` frees

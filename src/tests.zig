@@ -1761,3 +1761,18 @@ test "limits: Pike VM capture memory is bounded" {
     try std.testing.expect(counting.allocated_bytes < 4 * 1024 * 1024);
     try std.testing.expect((try s.find("x", 0)) != null);
 }
+
+test "limits: repeated Unicode classes do not multiply memory" {
+    if (!unicode.enabled) return error.SkipZigTest;
+    // Each of these used to keep its own copies of a large range table.
+    for ([_][]const u8{ "\\w", "\\W", "\\p{L}", "[\\w]", "(?i)[^\\p{L}]" }) |unit| {
+        const pattern = try repeated(unit, 1000);
+        defer gpa.free(pattern);
+        var counting = std.testing.FailingAllocator.init(gpa, .{});
+        var re = try regex.Regex.compile(counting.allocator(), pattern, .{ .utf8 = true }, null);
+        defer re.deinit(counting.allocator());
+        try std.testing.expectEqual(@as(usize, 1), re.prog.cp_sets.len);
+        try std.testing.expect(counting.allocated_bytes - counting.freed_bytes < 4 * 1024 * 1024);
+        try std.testing.expect(counting.allocated_bytes < 64 * 1024 * 1024);
+    }
+}

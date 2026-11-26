@@ -101,8 +101,31 @@ const Flags = struct {
     swap_greed: bool = false,
 };
 
+/// Hashes a list of ranges by value (`CpRange` has padding bits, so its raw
+/// bytes cannot be hashed).
+const RangesContext = struct {
+    pub fn hash(_: RangesContext, key: []const ucp.CpRange) u64 {
+        var h = std.hash.Wyhash.init(0);
+        for (key) |r| h.update(std.mem.asBytes(&[2]u32{ r.lo, r.hi }));
+        return h.final();
+    }
+    pub fn eql(_: RangesContext, a: []const ucp.CpRange, b: []const ucp.CpRange) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| if (x.lo != y.lo or x.hi != y.hi) return false;
+        return true;
+    }
+};
+
 const Parser = struct {
+    /// Holds the tree: lives until compilation is done.
     arena: std.mem.Allocator,
+    /// Holds a character class while it is built; reset when its node is made.
+    /// A Unicode class goes through several copies of large range lists.
+    scratch: std.mem.Allocator,
+    scratch_state: *std.heap.ArenaAllocator,
+    /// One node per distinct set of ranges, so a repeated `\w` costs its
+    /// ranges once, here and in the compiled program.
+    cp_nodes: std.HashMapUnmanaged([]const ucp.CpRange, *const Node, RangesContext, std.hash_map.default_max_load_percentage) = .empty,
     src: []const u8,
     pos: usize = 0,
     dialect: Dialect,
@@ -232,7 +255,7 @@ const Parser = struct {
             return;
         }
         if (lo < 0x80) cls.bytes.addRange(@intCast(lo), @intCast(@min(hi, 0x7f)));
-        if (hi >= 0x80) try cls.ranges.append(p.arena, .{ .lo = @max(lo, 0x80), .hi = hi });
+        if (hi >= 0x80) try cls.ranges.append(p.scratch, .{ .lo = @max(lo, 0x80), .hi = hi });
     }
 
     fn classAddCp(p: *Parser, cls: *Class, cp: u21) Error!void {
@@ -241,7 +264,7 @@ const Parser = struct {
 
     fn classUnion(p: *Parser, cls: *Class, other: Class) Error!void {
         cls.bytes.unionWith(other.bytes);
-        try cls.ranges.appendSlice(p.arena, other.ranges.items);
+        try cls.ranges.appendSlice(p.scratch, other.ranges.items);
     }
 
     /// Complement. In utf8 mode this is over the scalar values, so `[^a]`
@@ -252,8 +275,8 @@ const Parser = struct {
         var ascii: ByteSet = .{};
         ascii.addRange(0, 0x7f);
         cls.bytes.intersectWith(ascii);
-        try ucp.normalize(p.arena, &cls.ranges);
-        try ucp.complementFrom(p.arena, &cls.ranges, 0x80);
+        try ucp.normalize(p.scratch, &cls.ranges);
+        try ucp.complementFrom(p.scratch, &cls.ranges, 0x80);
     }
 
     /// A class from a set of ASCII bytes (all the built-in classes are ASCII).
@@ -266,8 +289,8 @@ const Parser = struct {
     /// Adds every scalar value in `table`, or every one outside it.
     fn classAddTable(p: *Parser, cls: *Class, table: unicode.Table, negate: bool) Error!void {
         var list: std.ArrayList(ucp.CpRange) = .empty;
-        try unicode.appendRanges(p.arena, &list, table);
-        if (negate) try ucp.complementFrom(p.arena, &list, 0);
+        try unicode.appendRanges(p.scratch, &list, table);
+        if (negate) try ucp.complementFrom(p.scratch, &list, 0);
         for (list.items) |r| try p.classAddRange(cls, r.lo, r.hi);
     }
 
@@ -308,7 +331,7 @@ const Parser = struct {
             cls.bytes.addAsciiCaseCounterparts();
             return;
         }
-        try ucp.normalize(p.arena, &cls.ranges);
+        try ucp.normalize(p.scratch, &cls.ranges);
         // Collect first: adding while scanning would unsort `ranges`.
         var additions: std.ArrayList(u21) = .empty;
         for (0..unicode.orbitCount()) |r| {
@@ -317,14 +340,17 @@ const Parser = struct {
             for (row) |cp| {
                 if (cp < 0x80) any = any or cls.bytes.has(@intCast(cp)) else any = any or ucp.containsRange(cls.ranges.items, cp);
             }
-            if (any) try additions.appendSlice(p.arena, row);
+            if (any) try additions.appendSlice(p.scratch, row);
         }
         for (additions.items) |cp| try p.classAddCp(cls, cp);
     }
 
+    /// The node for a finished class. Ends the class: nothing built in
+    /// `scratch` may be used after this.
     fn classNode(p: *Parser, cls: *Class) Error!*const Node {
+        defer _ = p.scratch_state.reset(.retain_capacity);
         if (!p.utf8) return p.node(.{ .set = cls.bytes });
-        try ucp.normalize(p.arena, &cls.ranges);
+        try ucp.normalize(p.scratch, &cls.ranges);
         // A class with no non-ASCII member stays a plain byte set.
         if (cls.ranges.items.len == 0) return p.node(.{ .set = cls.bytes });
         var all: std.ArrayList(ucp.CpRange) = .empty;
@@ -336,10 +362,14 @@ const Parser = struct {
             }
             const start = c;
             while (c < 0x80 and cls.bytes.has(c)) c += 1;
-            try all.append(p.arena, .{ .lo = start, .hi = c - 1 });
+            try all.append(p.scratch, .{ .lo = start, .hi = c - 1 });
         }
-        try all.appendSlice(p.arena, cls.ranges.items);
-        return p.node(.{ .cp_set = all.items });
+        try all.appendSlice(p.scratch, cls.ranges.items);
+        if (p.cp_nodes.get(all.items)) |known| return known;
+        const ranges = try p.arena.dupe(ucp.CpRange, all.items);
+        const made = try p.node(.{ .cp_set = ranges });
+        try p.cp_nodes.put(p.arena, ranges, made);
+        return made;
     }
 
     // alt := concat ('|' concat)*
@@ -982,13 +1012,13 @@ const Parser = struct {
 
     fn classCopy(p: *Parser, c: Class) Error!Class {
         var out: Class = .{ .bytes = c.bytes };
-        try out.ranges.appendSlice(p.arena, c.ranges.items);
+        try out.ranges.appendSlice(p.scratch, c.ranges.items);
         return out;
     }
 
     fn classIntersect(p: *Parser, a: *Class, b: *Class) Error!Class {
-        try ucp.normalize(p.arena, &a.ranges);
-        try ucp.normalize(p.arena, &b.ranges);
+        try ucp.normalize(p.scratch, &a.ranges);
+        try ucp.normalize(p.scratch, &b.ranges);
         var out: Class = .{ .bytes = a.bytes };
         out.bytes.intersectWith(b.bytes);
         var i: usize = 0;
@@ -998,7 +1028,7 @@ const Parser = struct {
             const y = b.ranges.items[j];
             const lo = @max(x.lo, y.lo);
             const hi = @min(x.hi, y.hi);
-            if (lo <= hi) try out.ranges.append(p.arena, .{ .lo = lo, .hi = hi });
+            if (lo <= hi) try out.ranges.append(p.scratch, .{ .lo = lo, .hi = hi });
             if (x.hi < y.hi) i += 1 else j += 1;
         }
         return out;
@@ -1235,6 +1265,7 @@ fn invalidUtf8At(s: []const u8) ?usize {
 
 pub fn parse(
     arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     pattern: []const u8,
     dialect: Dialect,
     ignore_case: bool,
@@ -1251,8 +1282,12 @@ pub fn parse(
         diag.* = .{ .pos = 0, .message = "pattern too long" };
         return error.LimitExceeded;
     }
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
     var p: Parser = .{
         .arena = arena,
+        .scratch = scratch.allocator(),
+        .scratch_state = &scratch,
         .src = pattern,
         .dialect = dialect,
         .utf8 = utf8,
@@ -1295,6 +1330,7 @@ fn stripAll(arena: std.mem.Allocator, items: []const *const Node) Error![]const 
 /// are rejected. On failure `diag.pattern` says which pattern.
 pub fn parseSet(
     arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     patterns: []const []const u8,
     dialect: Dialect,
     ignore_case: bool,
@@ -1304,7 +1340,7 @@ pub fn parseSet(
 ) Error!Parsed {
     var alts: std.ArrayList(*const Node) = .empty;
     for (patterns, 0..) |pat, i| {
-        const one = parse(arena, pat, dialect, ignore_case, utf8, limits, diag) catch |e| {
+        const one = parse(arena, gpa, pat, dialect, ignore_case, utf8, limits, diag) catch |e| {
             diag.pattern = i;
             return e;
         };

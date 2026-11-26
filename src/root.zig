@@ -70,7 +70,7 @@ pub const Regex = struct {
         const d = diag orelse &scratch;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
-        const parsed = try parse.parse(arena_state.allocator(), pattern, options.dialect, options.ignore_case, options.utf8, options.limits, d);
+        const parsed = try parse.parse(arena_state.allocator(), gpa, pattern, options.dialect, options.ignore_case, options.utf8, options.limits, d);
         return compileParsed(gpa, parsed, options, d);
     }
 
@@ -104,7 +104,7 @@ pub const RegexSet = struct {
         const d = diag orelse &scratch;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
-        const parsed = try parse.parseSet(arena_state.allocator(), patterns, options.dialect, options.ignore_case, options.utf8, options.limits, d);
+        const parsed = try parse.parseSet(arena_state.allocator(), gpa, patterns, options.dialect, options.ignore_case, options.utf8, options.limits, d);
         var all = try Regex.compileParsed(gpa, parsed, options, d);
         errdefer all.deinit(gpa);
         const each = try gpa.alloc(Regex, patterns.len);
