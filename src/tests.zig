@@ -286,16 +286,6 @@ test "limits: nesting, repeat count, program size, pattern length" {
     try expectCompileError("abc", .{ .limits = .{ .max_pattern_len = 2 } }, error.LimitExceeded);
 }
 
-test "allocation failures do not leak" {
-    var i: usize = 0;
-    while (i < 40) : (i += 1) {
-        var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = i });
-        const a = fa.allocator();
-        var re = regex.Regex.compile(a, "(?<n>a|b)+(?=c)\\k<n>[x-z]", .{}, null) catch continue;
-        re.deinit(a);
-    }
-}
-
 test "first-byte prefilter never skips a valid match" {
     try expectSpan("a*b", "xxb", .{ 2, 3 });
     try expectSpan("(a|)b", "zb", .{ 1, 2 });
@@ -1650,55 +1640,96 @@ test "fuzz: arbitrary patterns and haystacks never crash, and engines agree" {
     try std.testing.expect(compared > 3 * 300);
 }
 
-test "allocation failure: compile and search clean up and never crash" {
-    const patterns = [_]struct { pat: []const u8, opts: regex.Options }{
-        .{ .pat = "a(b|c)*d", .opts = .{} },
-        .{ .pat = "(a)\\1", .opts = .{} },
-        .{ .pat = "\\p{L}+é", .opts = .{ .utf8 = true } },
-        .{ .pat = "x\\{2,3\\}\\(y\\)", .opts = .{ .dialect = .posix_bre } },
-        .{ .pat = "[a-z&&[^aeiou]]+", .opts = .{ .dialect = .rust } },
-    };
-    patterns: for (patterns) |c| {
-        var fail_at: usize = 0;
-        while (true) : (fail_at += 1) {
-            var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
-            const a = fa.allocator();
-            var re = regex.Regex.compile(a, c.pat, c.opts, null) catch |e| {
-                // Unsupported never depends on allocation (for example \p{..}
-                // with -Dunicode_tables=false), so retrying would not end.
-                if (e == error.Unsupported) continue :patterns;
-                try std.testing.expect(e == error.OutOfMemory);
-                continue;
-            };
-            defer re.deinit(a);
-            var s = re.searcher(a) catch {
-                continue;
-            };
-            defer s.deinit();
-            _ = s.find("xabcd aab éé xxy", 0) catch {};
-            _ = s.count("abcabc") catch {};
-            if (!fa.has_induced_failure) break;
-        }
-        try std.testing.expect(fail_at > 3);
+const AllocCase = struct { pattern: []const u8, opts: regex.Options = .{}, tables: bool = false };
+
+// Every instruction family and engine: cp_class, byte-sequence tries, named
+// groups, look-around, atomic groups, loop guards, each dialect.
+const alloc_cases = [_]AllocCase{
+    .{ .pattern = "(?<n>a|b)+(?=c)\\k<n>[x-z]" },
+    .{ .pattern = "(?<=ab|c)x(?>y+)(?!z)" },
+    .{ .pattern = "(a)(?<b>b)*abcdef" },
+    .{ .pattern = "^a(b|c)*d" },
+    .{ .pattern = "(?:a*)*b", .opts = .{ .engine = .backtrack } },
+    .{ .pattern = "[é-ü]+.[^a]", .opts = .{ .utf8 = true } },
+    .{ .pattern = "(?i)\\p{L}+é[^\\p{L}]\\p{L}", .opts = .{ .utf8 = true }, .tables = true },
+    .{ .pattern = "x\\{2,3\\}\\(y\\)", .opts = .{ .dialect = .posix_bre } },
+    .{ .pattern = "(a|ab)\\1", .opts = .{ .dialect = .posix_ere } },
+    .{ .pattern = "[a-z&&[^aeiou]]+", .opts = .{ .dialect = .rust } },
+};
+
+const alloc_hay = "abbcx cxyy abababcdef éü☺ aab dxx ac xxxy abd\n";
+
+/// Compiles and runs every operation. checkAllAllocationFailures runs this
+/// with each allocation failing in turn, and requires OutOfMemory (nothing
+/// else, nothing swallowed) and no leak or double free.
+fn useEverything(a: std.mem.Allocator, c: AllocCase) !void {
+    var re = try regex.Regex.compile(a, c.pattern, c.opts, null);
+    defer re.deinit(a);
+    var s = try re.searcher(a);
+    defer s.deinit();
+    _ = try s.find(alloc_hay, 0);
+    _ = try s.count(alloc_hay);
+    _ = try s.isMatch(alloc_hay);
+    var lines = s.matchingLines(alloc_hay, false);
+    while (try lines.next()) |_| {}
+    a.free(try s.replaceAll(a, alloc_hay, "<$0>"));
+    a.free(try s.split(a, alloc_hay));
+    a.free(try s.findAll(a, alloc_hay));
+}
+
+test "allocation failure: compile and every operation" {
+    for (alloc_cases) |c| {
+        if (c.tables and !unicode.enabled) continue;
+        try std.testing.checkAllAllocationFailures(gpa, useEverything, .{c});
     }
 }
 
-test "allocation failure: sets and replacement" {
-    var fail_at: usize = 0;
-    while (true) : (fail_at += 1) {
-        var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
-        const a = fa.allocator();
-        var set = regex.RegexSet.compile(a, &.{ "ab", "c+", "(d)" }, .{}, null) catch continue;
-        defer set.deinit(a);
-        var s = set.searcher(a) catch continue;
-        defer s.deinit();
-        const out = s.replaceAll(a, "abccd", "<$0>") catch |e| {
-            try std.testing.expect(e == error.OutOfMemory or e == error.InvalidReplacement);
-            continue;
-        };
-        a.free(out);
-        if (!fa.has_induced_failure) break;
+fn useSet(a: std.mem.Allocator, utf8_mode: bool) !void {
+    const last: []const u8 = if (utf8_mode and unicode.enabled) "\\p{L}é" else "(d)";
+    var set = try regex.RegexSet.compile(a, &.{ "(?<n>ab)", "c+", last }, .{ .utf8 = utf8_mode }, null);
+    defer set.deinit(a);
+    var s = try set.searcher(a);
+    defer s.deinit();
+    a.free(try s.replaceAll(a, "abccdé", "<$0>"));
+    a.free(try set.matchedPatterns(a, "abccdé"));
+}
+
+test "allocation failure: sets" {
+    for ([_]bool{ false, true }) |utf8_mode|
+        try std.testing.checkAllAllocationFailures(gpa, useSet, .{utf8_mode});
+}
+
+test "allocation failure: a searcher stays correct afterwards" {
+    var failures: usize = 0;
+    for (alloc_cases) |c| {
+        if (c.tables and !unicode.enabled) continue;
+        var re = try regex.Regex.compile(gpa, c.pattern, c.opts, null);
+        defer re.deinit(gpa);
+        var reference = try re.searcher(gpa);
+        defer reference.deinit();
+        const want = try reference.findAll(gpa, alloc_hay);
+        defer gpa.free(want);
+        // Fail the n-th allocation made while searching, for each n.
+        var n: usize = 0;
+        while (true) : (n += 1) {
+            var fa = std.testing.FailingAllocator.init(gpa, .{});
+            var s = try re.searcher(fa.allocator());
+            defer s.deinit();
+            fa.fail_index = fa.alloc_index + n;
+            fa.resize_fail_index = fa.resize_index;
+            if (s.findAll(gpa, alloc_hay)) |got| gpa.free(got) else |e| try std.testing.expectEqual(error.OutOfMemory, e);
+            if (!fa.has_induced_failure) break;
+            failures += 1;
+            // Memory is available again: the same searcher must be right.
+            fa.fail_index = std.math.maxInt(usize);
+            fa.resize_fail_index = std.math.maxInt(usize);
+            const got = try s.findAll(gpa, alloc_hay);
+            defer gpa.free(got);
+            try std.testing.expectEqualSlices(regex.Span, want, got);
+        }
     }
+    // The engines do allocate while searching, so this tested something.
+    try std.testing.expect(failures > 10);
 }
 
 /// Reference for matchingLines: every line tested on its own with the
