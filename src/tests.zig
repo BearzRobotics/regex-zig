@@ -982,7 +982,9 @@ fn expectSameEngines(pattern: []const u8, opts: regex.Options, a: regex.Engine, 
 test "differential: the Pike VM agrees with the backtracker on random patterns" {
     var prng = std.Random.DefaultPrng.init(0xd1ff);
     const r = prng.random();
-    const alphabet = "abc\n";
+    // The bytes no pattern names ("xz ") make the first-byte skip jump, and the
+    // space gives word boundaries inside a line.
+    const alphabet = "abc\nxz ";
     var compared: usize = 0;
     for ([_]regex.Dialect{ .perl, .posix_ere, .posix_bre }) |dialect| {
         for (0..1500) |_| {
@@ -1705,4 +1707,14 @@ test "Match.group is null for a group the pattern does not have, on every engine
             try std.testing.expect(m.group(groups) != null);
         }
     }
+}
+
+test "the Pike VM forgets failed assertions when the first-byte skip moves on" {
+    // Perl and GNU grep find these; the Pike VM used to miss them.
+    for ([_]regex.Engine{ .auto, .dfa, .pike, .backtrack }) |engine| {
+        try expectSpanOpts("(?:\\bx)*\\by", "xz y", .{ 3, 4 }, .{ .engine = engine });
+        try expectSpanOpts("(\\bx)*\\by", "xz y", .{ 3, 4 }, .{ .dialect = .posix_ere, .engine = engine });
+    }
+    try expectSameEngines("x?\\bx*\\s", .{}, .pike, .backtrack, true, "\ncxybbc\ncaba");
+    try expectSameEngines("x?\\bz", .{ .dialect = .posix_ere }, .pike, .backtrack, false, "xb zc\nx y\nzc\n\n");
 }

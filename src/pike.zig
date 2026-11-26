@@ -155,6 +155,9 @@ pub const Pike = struct {
             if (!matched and p.startAllowed(hay, pos)) {
                 // With nothing running, skip positions that cannot start a match.
                 if (p.clist.nthreads == 0) if (p.first_bytes) |set| {
+                    // Closures that died on an assertion leave visited marks
+                    // behind. They belong to this position; the skip may move.
+                    p.clist.reset();
                     while (pos < hay.len and !(set.has(hay[pos]) and p.startAllowed(hay, pos))) pos += 1;
                     // The pattern cannot match empty, so it needs a byte.
                     if (pos >= hay.len) return null;
