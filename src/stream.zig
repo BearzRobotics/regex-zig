@@ -85,3 +85,36 @@ test "line anchors apply to each line" {
     try std.testing.expectEqualStrings("bd", (try it.next()).?.text);
     try std.testing.expect((try it.next()) == null);
 }
+
+test "LineStream: invert, a reader that delivers in pieces, and long lines" {
+    const gpa = std.testing.allocator;
+    var re = try regex.Regex.compile(gpa, "o", .{}, null);
+    defer re.deinit(gpa);
+    var s = try re.searcher(gpa);
+    defer s.deinit();
+
+    // Lines arrive split across reads, through a small buffer.
+    var buffer: [8]u8 = undefined;
+    var source = std.testing.Reader.init(&buffer, &.{
+        .{ .buffer = "one\ntw" }, .{ .buffer = "o\nx" }, .{ .buffer = "yz\n\nfo" }, .{ .buffer = "ur" },
+    });
+    source.artificial_limit = .limited(3);
+    var inverted: LineStream = .{ .searcher = &s, .reader = &source.interface, .invert = true };
+    for ([_]struct { n: usize, start: usize, text: []const u8 }{
+        .{ .n = 3, .start = 8, .text = "xyz" },
+        .{ .n = 4, .start = 12, .text = "" },
+    }) |want| {
+        const line = (try inverted.next()).?;
+        try std.testing.expectEqual(want.n, line.number);
+        try std.testing.expectEqual(want.start, line.start);
+        try std.testing.expectEqualStrings(want.text, line.text);
+    }
+    try std.testing.expect((try inverted.next()) == null);
+
+    // A line that does not fit the buffer is an error, never a split line.
+    var small: [4]u8 = undefined;
+    var long = std.testing.Reader.init(&small, &.{.{ .buffer = "ok\ntoo long for it\n" }});
+    var stream: LineStream = .{ .searcher = &s, .reader = &long.interface };
+    try std.testing.expectEqualStrings("ok", (try stream.next()).?.text);
+    try std.testing.expectError(error.StreamTooLong, stream.next());
+}

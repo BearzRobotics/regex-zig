@@ -210,6 +210,10 @@ fn runSet(io: std.Io, gpa: std.mem.Allocator, nwords: usize) !void {
         try offs.append(gpa, .{ o, store.items.len });
     }
     for (offs.items) |o| try pats.append(gpa, store.items[o[0]..o[1]]);
+    // Random words never occur in the text, which measures only the miss. Two
+    // words that do give the match path something to do.
+    pats.items[0] = "farmer";
+    pats.items[nwords / 2] = "angry";
     const t0 = now(io);
     var set = try regex.RegexSet.compile(gpa, pats.items, .{ .dialect = .posix_ere }, null);
     defer set.deinit(gpa);

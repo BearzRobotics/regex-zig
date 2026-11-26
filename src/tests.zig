@@ -252,7 +252,9 @@ test "\\G anchors at the search start" {
     defer s.deinit();
     const m = (try s.find("xab ab", 4)).?;
     try std.testing.expectEqual(@as(usize, 4), m.start());
-    try std.testing.expect((try s.find("xab ab", 1)) != null);
+    const first = (try s.find("xab ab", 1)).?;
+    try std.testing.expectEqual(@as(usize, 1), first.start());
+    try std.testing.expectEqual(@as(usize, 3), first.end());
     try std.testing.expect((try s.find("xxab", 1)) == null);
 }
 
@@ -780,6 +782,8 @@ test "pathological patterns run in linear time with the default engine" {
         defer gpa.free(hay);
         var re = try regex.Regex.compile(gpa, c.pattern, .{}, null);
         defer re.deinit(gpa);
+        // The claim under test is about the engine, not the clock.
+        try std.testing.expect(re.isLinearTime());
         var s = try re.searcher(gpa);
         defer s.deinit();
         // None of these match; the point is that the answer comes back.
@@ -1385,6 +1389,9 @@ test "regex set: any member matches, earlier patterns win ties" {
     defer gpa.free(which);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, which);
     try std.testing.expectEqual(@as(usize, 3), set.len());
+    const every = try set.matchedPatterns(gpa, "foo baar x1");
+    defer gpa.free(every);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, every);
 }
 
 test "regex set: leftmost-first picks the earlier pattern, POSIX the longest" {
@@ -1485,22 +1492,35 @@ test "literal prefix with a prefix at the end of the haystack and overlapping st
 // BRE and ERE patterns, and which lines GNU grep selects (LC_ALL=C).
 const grep_cases = @embedFile("testdata/grep_cases.txt");
 
-// Patterns where GNU grep 3.12 disagrees with Perl-style back-reference
-// semantics. regex-zig follows Perl here (leftmost-first/longest with the
-// capture of the last iteration, empty iterations allowed); GNU grep reports
-// no match. Documented in docs/compatibility/posix_ere.md.
-const known_grep_deviations = [_][]const u8{
-    "b|((c?)){2}\\1$", // back-reference to a group that is repeated and can be empty
-};
-
-fn isKnownDeviation(pattern: []const u8) bool {
-    for (known_grep_deviations) |k| if (std.mem.eql(u8, k, pattern)) return true;
-    return false;
+// One known difference, not in the generated data: for a back-reference to a
+// group that is repeated and can match empty, GNU grep selects fewer lines.
+// regex-zig follows Perl (docs/compatibility/posix_ere.md).
+test "back-reference to a repeated empty group follows Perl, not GNU grep" {
+    for ([_][]const u8{ "", "a", "c", "cc" }) |line|
+        try std.testing.expect((try span("b|((c?)){2}\\1$", line, .{ .dialect = .posix_ere })) != null);
 }
 
-fn checkGrepCases(mode: u8, engine: regex.Engine) !usize {
-    const dialect: regex.Dialect = if (mode == 'E') .posix_ere else .posix_bre;
-    var failures: usize = 0;
+const GrepCount = struct { failures: usize = 0, lines: usize = 0, spans: usize = 0 };
+
+/// The first non-empty match, which is what `grep -o` prints first.
+fn firstNonEmpty(s: *regex.Searcher, line: []const u8) !?[2]usize {
+    var it = s.matches(line);
+    while (try it.next()) |m| if (m.end() > m.start()) return .{ m.start(), m.end() };
+    return null;
+}
+
+fn parseSpan(text: []const u8) !?[2]usize {
+    if (std.mem.eql(u8, text, "-")) return null;
+    const comma = std.mem.indexOfScalar(u8, text, ',').?;
+    return .{ try std.fmt.parseInt(usize, text[0..comma], 10), try std.fmt.parseInt(usize, text[comma + 1 ..], 10) };
+}
+
+/// Checks every case of one mode ("E", "B", "Ei", "Bi") on one engine:
+/// which lines match, and where.
+fn checkGrepCases(mode: []const u8, engine: regex.Engine) !GrepCount {
+    const dialect: regex.Dialect = if (mode[0] == 'E') .posix_ere else .posix_bre;
+    const opts: regex.Options = .{ .dialect = dialect, .engine = engine, .ignore_case = mode.len > 1 };
+    var count: GrepCount = .{};
     var lines = std.mem.splitScalar(u8, grep_cases, '\n');
     var re: ?regex.Regex = null;
     var s: ?regex.Searcher = null;
@@ -1510,50 +1530,64 @@ fn checkGrepCases(mode: u8, engine: regex.Engine) !usize {
     }
     var pattern: []const u8 = "";
     var active = false;
-    while (lines.next()) |line| {
-        if (line.len == 0 or line[0] == '#') continue;
-        var f = std.mem.splitScalar(u8, line, '\t');
+    while (lines.next()) |record| {
+        if (record.len == 0 or record[0] == '#') continue;
+        var f = std.mem.splitScalar(u8, record, '\t');
         const kind = f.next().?;
         const a = f.next().?;
-        const b = f.rest();
         if (std.mem.eql(u8, kind, "P")) {
             if (s) |*x| x.deinit();
             if (re) |*x| x.deinit(gpa);
             s = null;
             re = null;
-            active = a[0] == mode and !isKnownDeviation(b);
+            pattern = f.rest();
+            active = std.mem.eql(u8, a, mode);
             if (!active) continue;
-            pattern = b;
-            re = regex.Regex.compile(gpa, pattern, .{ .dialect = dialect, .engine = engine }, null) catch |e| {
+            re = regex.Regex.compile(gpa, pattern, opts, null) catch |e| {
                 // A forced engine may legitimately refuse (back-references).
-                if (engine != .auto and e == error.Unsupported) {
-                    active = false;
-                    continue;
-                }
-                std.debug.print("COMPILE {s} pattern={s}: {s}\n", .{ @tagName(dialect), pattern, @errorName(e) });
-                failures += 1;
                 active = false;
+                if (engine != .auto and e == error.Unsupported) continue;
+                std.debug.print("COMPILE {s} pattern={s}: {s}\n", .{ mode, pattern, @errorName(e) });
+                count.failures += 1;
                 continue;
             };
             s = try re.?.searcher(gpa);
         } else if (active) {
             const want = a[0] == '1';
-            const got = try s.?.isMatch(b);
+            const want_span = try parseSpan(f.next().?);
+            const line = f.rest();
+            const got = try s.?.isMatch(line);
+            count.lines += 1;
             if (got != want) {
-                std.debug.print("GREP MISMATCH {s}/{s} pattern={s} line=\"{s}\" grep={} ours={}\n", .{ @tagName(dialect), @tagName(engine), pattern, b, want, got });
-                failures += 1;
+                std.debug.print("GREP MISMATCH {s}/{s} pattern={s} line=\"{s}\" grep={} ours={}\n", .{ mode, @tagName(engine), pattern, line, want, got });
+                count.failures += 1;
+            }
+            if (want_span == null) continue;
+            const got_span = try firstNonEmpty(&s.?, line);
+            count.spans += 1;
+            if (!std.meta.eql(got_span, want_span)) {
+                std.debug.print("GREP SPAN {s}/{s} pattern={s} line=\"{s}\" grep={any} ours={any}\n", .{ mode, @tagName(engine), pattern, line, want_span, got_span });
+                count.failures += 1;
             }
         }
     }
-    return failures;
+    return count;
 }
 
-test "GNU grep agreement: ERE and BRE on every engine" {
-    var total: usize = 0;
-    for ([_]u8{ 'E', 'B' }) |mode| {
-        for ([_]regex.Engine{ .auto, .pike, .backtrack }) |eng| total += try checkGrepCases(mode, eng);
+test "GNU grep agreement: lines and match spans, ERE and BRE, with and without -i" {
+    var failures: usize = 0;
+    for ([_][]const u8{ "E", "B", "Ei", "Bi" }) |mode| {
+        // .auto is the DFA where it can be.
+        for ([_]regex.Engine{ .auto, .pike, .backtrack }) |engine| {
+            const c = try checkGrepCases(mode, engine);
+            failures += c.failures;
+            // An empty or truncated data file must not pass.
+            const patterns: usize = if (mode.len > 1) 200 else 700;
+            try std.testing.expect(c.lines > patterns * 7);
+            try std.testing.expect(c.spans > patterns);
+        }
     }
-    try std.testing.expectEqual(@as(usize, 0), total);
+    try std.testing.expectEqual(@as(usize, 0), failures);
 }
 
 // ---- robustness: fuzzing and allocation failure -----------------------------------------
@@ -1732,9 +1766,11 @@ test "allocation failure: a searcher stays correct afterwards" {
     try std.testing.expect(failures > 10);
 }
 
+const Line = struct { number: usize, start: usize, len: usize };
+
 /// Reference for matchingLines: every line tested on its own with the
 /// backtracking engine, which has no skipping.
-fn linesReference(pattern: []const u8, hay: []const u8, opts: regex.Options, out: *std.ArrayList(usize)) !void {
+fn linesReference(pattern: []const u8, hay: []const u8, opts: regex.Options, invert: bool, out: *std.ArrayList(Line)) !void {
     var bo = opts;
     bo.engine = .backtrack;
     var re = try regex.Regex.compile(gpa, pattern, bo, null);
@@ -1742,11 +1778,13 @@ fn linesReference(pattern: []const u8, hay: []const u8, opts: regex.Options, out
     var s = try re.searcher(gpa);
     defer s.deinit();
     var n: usize = 0;
+    var start: usize = 0;
     var it = std.mem.splitScalar(u8, hay, '\n');
     while (it.next()) |line| {
         n += 1;
         if (it.peek() == null and line.len == 0) break;
-        if ((try s.find(line, 0)) != null) try out.append(gpa, n);
+        if (((try s.find(line, 0)) != null) != invert) try out.append(gpa, .{ .number = n, .start = start, .len = line.len });
+        start += line.len + 1;
     }
 }
 
@@ -1766,21 +1804,23 @@ test "perf: matchingLines skipping agrees with per-line search (numbers, offsets
         .{ .pat = "x*", .opts = .{} },
     };
     for (cases) |c| {
-        var want: std.ArrayList(usize) = .empty;
-        defer want.deinit(gpa);
-        try linesReference(c.pat, hay, c.opts, &want);
-        var re = try regex.Regex.compile(gpa, c.pat, c.opts, null);
-        defer re.deinit(gpa);
-        var s = try re.searcher(gpa);
-        defer s.deinit();
-        var it = s.matchingLines(hay, false);
-        var got: std.ArrayList(usize) = .empty;
-        defer got.deinit(gpa);
-        while (try it.next()) |l| {
-            try got.append(gpa, l.number);
-            try std.testing.expect(std.mem.startsWith(u8, hay[l.start..], l.text));
+        for ([_]bool{ false, true }) |invert| {
+            var want: std.ArrayList(Line) = .empty;
+            defer want.deinit(gpa);
+            try linesReference(c.pat, hay, c.opts, invert, &want);
+            var re = try regex.Regex.compile(gpa, c.pat, c.opts, null);
+            defer re.deinit(gpa);
+            var s = try re.searcher(gpa);
+            defer s.deinit();
+            var it = s.matchingLines(hay, invert);
+            var got: std.ArrayList(Line) = .empty;
+            defer got.deinit(gpa);
+            while (try it.next()) |l| {
+                try got.append(gpa, .{ .number = l.number, .start = l.start, .len = l.text.len });
+                try std.testing.expectEqualStrings(hay[l.start..][0..l.text.len], l.text);
+            }
+            try std.testing.expectEqualSlices(Line, want.items, got.items);
         }
-        try std.testing.expectEqualSlices(usize, want.items, got.items);
     }
 }
 
