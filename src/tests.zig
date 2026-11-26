@@ -892,6 +892,8 @@ const Gen = struct {
     /// A quantifier was applied to something containing a group: capture
     /// positions may legitimately differ between the engines then.
     quantified_group: bool = false,
+    /// Some quantifier is lazy.
+    lazy: bool = false,
 
     fn put(g: *Gen, s: []const u8) Oom!void {
         try g.out.appendSlice(gpa, s);
@@ -916,7 +918,10 @@ const Gen = struct {
         const quants = [_][]const u8{ "*", "+", "?", "{1,2}", "{2}", "{0,2}" };
         const bre_quants = [_][]const u8{ "*", "\\+", "\\?", "\\{1,2\\}", "\\{2\\}", "\\{0,2\\}" };
         try g.put(if (g.bre) bre_quants[g.r.uintLessThan(usize, bre_quants.len)] else quants[g.r.uintLessThan(usize, quants.len)]);
-        if (!g.ere and g.r.uintLessThan(u8, 3) == 0) try g.put("?");
+        if (!g.ere and g.r.uintLessThan(u8, 3) == 0) {
+            try g.put("?");
+            g.lazy = true;
+        }
         if (has_group) g.quantified_group = true;
     }
 
@@ -1041,7 +1046,7 @@ test "differential: utf8 patterns agree between the engines" {
 test "differential: the lazy DFA agrees with the Pike VM on random patterns" {
     var prng = std.Random.DefaultPrng.init(0xdfa);
     const r = prng.random();
-    const alphabet = "abc\n";
+    const alphabet = "abc\nxz ";
     var compared: usize = 0;
     for ([_]regex.Dialect{ .perl, .posix_ere, .oniguruma, .posix_bre }) |dialect| {
         for (0..1500) |_| {
@@ -1056,6 +1061,12 @@ test "differential: the lazy DFA agrees with the Pike VM on random patterns" {
                 const len = r.uintLessThan(usize, hay.len + 1);
                 for (hay[0..len]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
                 try expectSameEngines(g.out.items, .{ .dialect = dialect }, .dfa, .pike, true, hay[0..len]);
+                // In the POSIX dialects the DFA path takes its spans from the
+                // Pike VM, so the backtracker is the independent answer. A
+                // lazy part inside a repeated group is the known deviation
+                // (ADR 0002, section 4).
+                if (!(g.lazy and g.quantified_group))
+                    try expectSameEngines(g.out.items, .{ .dialect = dialect }, .dfa, .backtrack, false, hay[0..len]);
                 compared += 1;
             }
         }
@@ -1556,6 +1567,28 @@ test "GNU grep agreement: ERE and BRE on every engine" {
 
 // ---- robustness: fuzzing and allocation failure -----------------------------------------
 
+/// Whether a compile failed for a reason a random pattern can give.
+fn expectedCompileFailure(e: regex.Error) regex.Error!void {
+    return switch (e) {
+        error.InvalidPattern, error.Unsupported, error.LimitExceeded => {},
+        error.OutOfMemory => e,
+    };
+}
+
+/// The span of every match, or false when a limit stopped the search.
+fn allSpans(s: *regex.Searcher, hay: []const u8, out: *std.ArrayList([2]usize)) !bool {
+    out.clearRetainingCapacity();
+    var it = s.matches(hay);
+    while (true) {
+        const m = it.next() catch |e| switch (e) {
+            error.StepLimitExceeded, error.StackLimitExceeded => return false,
+            error.OutOfMemory => return e,
+        } orelse return true;
+        try std.testing.expect(m.start() <= m.end() and m.end() <= hay.len);
+        try out.append(gpa, .{ m.start(), m.end() });
+    }
+}
+
 test "fuzz: arbitrary patterns and haystacks never crash, and engines agree" {
     var prng = std.Random.DefaultPrng.init(0xf022);
     const r = prng.random();
@@ -1563,6 +1596,11 @@ test "fuzz: arbitrary patterns and haystacks never crash, and engines agree" {
     const pat_chars = "abc.*+?|()[]{}^$\\-,:=!<>&~0123 \n\xc3\xa9\x80\xff";
     const hay_chars = "abc \n\xc3\xa9\x80\xff1";
     var compiled: usize = 0;
+    var compared: usize = 0;
+    var want: std.ArrayList([2]usize) = .empty;
+    defer want.deinit(gpa);
+    var got: std.ArrayList([2]usize) = .empty;
+    defer got.deinit(gpa);
     for (0..4000) |_| {
         var pat_buf: [14]u8 = undefined;
         const plen = r.uintLessThan(usize, pat_buf.len + 1);
@@ -1571,7 +1609,10 @@ test "fuzz: arbitrary patterns and haystacks never crash, and engines agree" {
         const dialect: regex.Dialect = @fromBackingInt(@intCast(r.uintLessThan(u8, 5)));
         const opts: regex.Options = .{ .dialect = dialect, .utf8 = r.boolean(), .ignore_case = r.uintLessThan(u8, 4) == 0, .limits = .{ .max_steps = 200_000 } };
 
-        var re = regex.Regex.compile(gpa, pat, opts, null) catch continue;
+        var re = regex.Regex.compile(gpa, pat, opts, null) catch |e| {
+            try expectedCompileFailure(e);
+            continue;
+        };
         re.deinit(gpa);
         compiled += 1;
         var hay_buf: [16]u8 = undefined;
@@ -1579,29 +1620,33 @@ test "fuzz: arbitrary patterns and haystacks never crash, and engines agree" {
         for (hay_buf[0..hlen]) |*c| c.* = hay_chars[r.uintLessThan(usize, hay_chars.len)];
         const hay = hay_buf[0..hlen];
 
-        // Every engine that accepts the pattern must give the same spans.
-        var first: ?[2]?[2]usize = null;
-        for ([_]regex.Engine{ .auto, .dfa, .pike, .backtrack }) |eng| {
+        // Every engine that accepts the pattern must find the same matches.
+        var have_first = false;
+        for ([_]regex.Engine{ .backtrack, .auto, .dfa, .pike }) |eng| {
             var o = opts;
             o.engine = eng;
-            var e = regex.Regex.compile(gpa, pat, o, null) catch continue;
+            var e = regex.Regex.compile(gpa, pat, o, null) catch |err| {
+                try expectedCompileFailure(err);
+                continue;
+            };
             defer e.deinit(gpa);
             var s = try e.searcher(gpa);
             defer s.deinit();
-            const m = s.find(hay, 0) catch |err| switch (err) {
-                error.StepLimitExceeded, error.StackLimitExceeded => continue,
-                else => return err,
-            };
-            const got: [2]?[2]usize = .{ if (m) |mm| .{ mm.start(), mm.end() } else null, null };
-            if (first) |f| {
-                if (!std.meta.eql(f[0], got[0])) {
-                    std.debug.print("ENGINE DISAGREE pattern={s} hay={any} dialect={s} utf8={}\n", .{ pat, hay, @tagName(dialect), opts.utf8 });
-                    return error.TestUnexpectedResult;
-                }
-            } else first = got;
+            if (!try allSpans(&s, hay, if (have_first) &got else &want)) continue;
+            try std.testing.expectEqual((if (have_first) got else want).items.len > 0, try s.isMatch(hay));
+            if (!have_first) {
+                have_first = true;
+                continue;
+            }
+            compared += 1;
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(want.items), std.mem.sliceAsBytes(got.items))) {
+                std.debug.print("ENGINE DISAGREE pattern={s} hay={any} dialect={s} utf8={} {s}\n", .{ pat, hay, @tagName(dialect), opts.utf8, @tagName(eng) });
+                return error.TestUnexpectedResult;
+            }
         }
     }
     try std.testing.expect(compiled > 300);
+    try std.testing.expect(compared > 3 * 300);
 }
 
 test "allocation failure: compile and search clean up and never crash" {
@@ -2047,4 +2092,111 @@ test "known deviation: a lazy loop body that can match empty" {
     const p = "(\\w{0,2}?)+b";
     try expectSpanOpts(p, "cbb", .{ 0, 2 }, .{ .engine = .backtrack });
     try expectSpanOpts(p, "cbb", .{ 0, 3 }, .{ .engine = .pike });
+}
+
+/// Random patterns using what only the backtracker implements, including
+/// references to a group from inside it.
+fn backtrackerPattern(r: std.Random, out: *std.ArrayList(u8), depth: u32) Oom!void {
+    const pieces = r.intRangeAtMost(u8, 1, 3);
+    for (0..pieces) |_| {
+        var repeatable = true;
+        switch (r.uintLessThan(u8, 12)) {
+            0, 1, 2 => try out.append(gpa, "abx "[r.uintLessThan(usize, 4)]),
+            3 => try out.append(gpa, '.'),
+            4, 5, 6 => if (depth > 0) {
+                const opens = [_][]const u8{ "(", "(", "(?:", "(?>", "(?=", "(?!" };
+                const k = r.uintLessThan(usize, opens.len);
+                try out.appendSlice(gpa, opens[k]);
+                try backtrackerPattern(r, out, depth - 1);
+                try out.append(gpa, ')');
+                repeatable = k < 4;
+            } else try out.append(gpa, 'a'),
+            7, 8, 9 => try out.appendSlice(gpa, if (r.boolean()) "\\1" else "\\2"),
+            10 => {
+                try out.appendSlice(gpa, if (r.boolean()) "(?<=a)" else "(?<!bx)");
+                repeatable = false;
+            },
+            else => {
+                try out.appendSlice(gpa, "\\b");
+                repeatable = false;
+            },
+        }
+        if (repeatable and r.uintLessThan(u8, 3) == 0) {
+            const quants = [_][]const u8{ "*", "+", "?", "{0,2}", "*?", "+?", "*+", "++" };
+            try out.appendSlice(gpa, quants[r.uintLessThan(usize, quants.len)]);
+        }
+    }
+    if (r.uintLessThan(u8, 4) == 0 and depth > 0) {
+        try out.append(gpa, '|');
+        try backtrackerPattern(r, out, depth - 1);
+    }
+}
+
+test "fuzz: back-references, look-around and atomic groups never crash" {
+    var prng = std.Random.DefaultPrng.init(0xbac);
+    const r = prng.random();
+    var searched: usize = 0;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var spans: std.ArrayList([2]usize) = .empty;
+    defer spans.deinit(gpa);
+    for (0..20_000) |_| {
+        out.clearRetainingCapacity();
+        try backtrackerPattern(r, &out, 3);
+        const opts: regex.Options = .{ .ignore_case = r.uintLessThan(u8, 4) == 0, .utf8 = r.boolean(), .limits = .{ .max_steps = 20_000 } };
+        var re = regex.Regex.compile(gpa, out.items, opts, null) catch |e| {
+            try expectedCompileFailure(e);
+            continue;
+        };
+        defer re.deinit(gpa);
+        var s = try re.searcher(gpa);
+        defer s.deinit();
+        for (0..4) |_| {
+            var hay: [10]u8 = undefined;
+            const len = r.uintLessThan(usize, hay.len + 1);
+            for (hay[0..len]) |*c| c.* = "aAbx "[r.uintLessThan(usize, 5)];
+            if (!try allSpans(&s, hay[0..len], &spans)) continue;
+            searched += 1;
+            // Every capture of every match lies inside the haystack.
+            var it = s.matches(hay[0..len]);
+            while (try it.next()) |m| {
+                var g: u32 = 1;
+                while (g <= re.groupCount()) : (g += 1) if (m.group(g)) |c|
+                    try std.testing.expect(c[0] <= c[1] and c[1] <= len);
+            }
+        }
+    }
+    try std.testing.expect(searched > 5000);
+}
+
+test "line search gives the same lines from a slice and from a stream" {
+    var prng = std.Random.DefaultPrng.init(0x57e4);
+    const r = prng.random();
+    for ([_][]const u8{ "ab", "^a|b$", "x*", "^$", "\\bab\\b", "(a)\\1", "[^a]b" }) |pattern| {
+        var re = try regex.Regex.compile(gpa, pattern, .{}, null);
+        defer re.deinit(gpa);
+        var s = try re.searcher(gpa);
+        defer s.deinit();
+        for (0..200) |_| {
+            var hay: [80]u8 = undefined;
+            const len = r.uintLessThan(usize, hay.len + 1);
+            for (hay[0..len]) |*c| c.* = "abx \n"[r.uintLessThan(usize, 5)];
+            for ([_]bool{ false, true }) |invert| {
+                var from_slice = s.matchingLines(hay[0..len], invert);
+                var reader = std.Io.Reader.fixed(hay[0..len]);
+                var from_stream: regex.LineStream = .{ .searcher = &s, .reader = &reader, .invert = invert };
+                while (true) {
+                    // Each iterator drives the same searcher in turn; a Line
+                    // borrows the haystack, not the searcher.
+                    const a = try from_slice.next();
+                    const b = try from_stream.next();
+                    try std.testing.expectEqual(a == null, b == null);
+                    if (a == null) break;
+                    try std.testing.expectEqual(a.?.number, b.?.number);
+                    try std.testing.expectEqual(a.?.start, b.?.start);
+                    try std.testing.expectEqualStrings(a.?.text, b.?.text);
+                }
+            }
+        }
+    }
 }
