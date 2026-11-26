@@ -36,6 +36,8 @@ const Frame = union(enum) {
 };
 
 pub const Match = struct {
+    /// Two offsets per group, group 0 (the whole match) first; `unset` for a
+    /// group that did not participate.
     regs: []const usize,
 
     pub fn start(m: Match) usize {
@@ -47,8 +49,9 @@ pub const Match = struct {
     }
 
     /// Span of capture group `i` (0 = whole match), or null if it did not
-    /// participate.
+    /// participate or the pattern has no group `i`.
     pub fn group(m: Match, i: u32) ?[2]usize {
+        if (i >= m.regs.len / 2) return null;
         const a = m.regs[2 * i];
         const b = m.regs[2 * i + 1];
         if (a == unset or b == unset) return null;
@@ -137,9 +140,14 @@ pub const Searcher = struct {
             }
             @memset(s.regs, unset);
             s.stack.clearRetainingCapacity();
-            if (try s.run(hay, start, from)) return .{ .regs = s.regs };
+            if (try s.run(hay, start, from)) return .{ .regs = s.captureRegs() };
         }
         return null;
+    }
+
+    /// The capture part of `regs`; the backtracker keeps its own state after it.
+    fn captureRegs(s: *const Searcher) []const usize {
+        return s.regs[0 .. 2 * (s.prog.group_count + 1)];
     }
 
     fn findPike(s: *Searcher, hay: []const u8, from: usize) ?Match {
@@ -169,7 +177,7 @@ pub const Searcher = struct {
         if (s.prog.group_count == 0) {
             s.regs[0] = start;
             s.regs[1] = end;
-            return .{ .regs = s.regs };
+            return .{ .regs = s.captureRegs() };
         }
         return s.findPike(hay, start);
     }

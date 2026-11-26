@@ -1687,3 +1687,22 @@ test "a back-reference inside its own group sees the previous capture" {
     try expectSpanOpts("(?:(a|b\\1)x)+", "axBAx", .{ 0, 5 }, .{ .ignore_case = true });
     try expectSpanOpts("(?:(a|b\\1)x)+", "axbx", .{ 0, 2 }, .{ .ignore_case = true, .utf8 = true });
 }
+
+test "Match.group is null for a group the pattern does not have, on every engine" {
+    for ([_]regex.Engine{ .auto, .dfa, .pike, .backtrack }) |engine| {
+        // A loop that can match empty gives the backtracker extra registers,
+        // which must not show up as captures.
+        for ([_][]const u8{ "(?:a*)*b", "((?:a*)*)b" }) |pattern| {
+            var re = try regex.Regex.compile(gpa, pattern, .{ .engine = engine }, null);
+            defer re.deinit(gpa);
+            var s = try re.searcher(gpa);
+            defer s.deinit();
+            const m = (try s.find("aab", 0)).?;
+            const groups = re.groupCount();
+            try std.testing.expectEqual(2 * (groups + 1), m.regs.len);
+            for ([_]u32{ groups + 1, groups + 2, 7, std.math.maxInt(u32) }) |i|
+                try std.testing.expect(m.group(i) == null);
+            try std.testing.expect(m.group(groups) != null);
+        }
+    }
+}
