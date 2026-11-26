@@ -131,6 +131,12 @@ pub const Searcher = struct {
             const regs = vm.find(hay, from) orelse return null;
             return .{ .regs = regs };
         }
+        return s.findBacktrack(hay, from, false);
+    }
+
+    /// With `any`, the first match found will do, even in leftmost-longest
+    /// mode: only whether there is one matters.
+    fn findBacktrack(s: *Searcher, hay: []const u8, from: usize, any: bool) MatchError!?Match {
         s.steps = 0;
         var start = from;
         const first = s.prog.first_bytes;
@@ -145,7 +151,7 @@ pub const Searcher = struct {
             }
             @memset(s.regs, unset);
             s.stack.clearRetainingCapacity();
-            if (try s.run(hay, start, from)) return .{ .regs = s.captureRegs() };
+            if (try s.run(hay, start, from, any)) return .{ .regs = s.captureRegs() };
         }
         return null;
     }
@@ -210,6 +216,7 @@ pub const Searcher = struct {
             // null: either no match, or the DFA gave up; only the first is final.
             if (s.fwd.?.search_flushes <= 4) return false;
         }
+        if (s.fwd == null and s.pike == null) return (try s.findBacktrack(hay, 0, true)) != null;
         return (try s.find(hay, 0)) != null;
     }
 
@@ -270,7 +277,7 @@ pub const Searcher = struct {
         return true;
     }
 
-    fn run(s: *Searcher, hay: []const u8, start: usize, search_start: usize) MatchError!bool {
+    fn run(s: *Searcher, hay: []const u8, start: usize, search_start: usize, any: bool) MatchError!bool {
         s.have_best = false;
         const insts = s.prog.insts;
         var pc: u32 = 0;
@@ -383,12 +390,14 @@ pub const Searcher = struct {
                     pc += 1;
                 },
                 .loop_end => |l| pc = if (s.regs[l.slot] == pos) pc + 1 else l.target,
-                .match => if (s.prog.longest) {
+                .match => if (s.prog.longest and !any) {
                     // Keep the longest; go on exploring the other alternatives.
                     if (!s.have_best or s.regs[1] > s.best[1]) {
                         @memcpy(s.best, s.regs);
                         s.have_best = true;
                     }
+                    // Nothing can be longer than the rest of the text.
+                    if (s.best[1] == hay.len) return s.finishRun();
                     ok = false;
                 } else return true,
             }

@@ -1791,3 +1791,21 @@ test "limits: the step budget counts the bytes back-references compare" {
         try std.testing.expect((try s.find(hay, 0)) != null);
     }
 }
+
+test "posix: the yes/no question does not search for the longest match" {
+    // Exhausting every way to split the line takes far more than the budget.
+    const hay = try repeated("a", 400);
+    defer gpa.free(hay);
+    for ([_]regex.Dialect{ .posix_ere, .posix_bre, .perl }) |dialect| {
+        const pattern = if (dialect == .posix_bre) "\\(.*\\)\\(.*\\)\\(.*\\)\\1" else "(.*)(.*)(.*)\\1";
+        var re = try regex.Regex.compile(gpa, pattern, .{ .dialect = dialect }, null);
+        defer re.deinit(gpa);
+        var s = try re.searcher(gpa);
+        defer s.deinit();
+        try std.testing.expect(try s.isMatch(hay));
+        var lines = s.matchingLines(hay, false);
+        try std.testing.expect((try lines.next()) != null);
+        // The longest match is the whole line, so find can stop there too.
+        try std.testing.expectEqual(hay.len, (try s.find(hay, 0)).?.end());
+    }
+}
