@@ -1670,3 +1670,20 @@ test "a cp_class that fails to compile is freed once: allocation failure" {
     if (!unicode.enabled) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(gpa, compileSet, .{});
 }
+
+fn expectCaptures(pattern: []const u8, hay: []const u8, want: [2]usize, group1: ?[]const u8) !void {
+    try expectSpan(pattern, hay, want);
+    try expectGroup(pattern, hay, 1, group1);
+}
+
+test "a back-reference inside its own group sees the previous capture" {
+    // Expected results are Perl 5.40's. The first one used to underflow.
+    try expectCaptures("(?:(a|b\\1)x)+", "axbx", .{ 0, 2 }, "a");
+    try expectCaptures("(?:(a|b\\1)x)+", "axbax", .{ 0, 5 }, "ba");
+    try expectCaptures("(a|b\\1)+", "aba", .{ 0, 3 }, "ba");
+    try expectCaptures("^(a|b\\1)+$", "aba", .{ 0, 3 }, "ba");
+    try expectCaptures("(a\\1?)+", "aaaa", .{ 0, 4 }, "a");
+    try expectSpan("b|(?>a|(\\w{0,2}ba\\W|\\1*b{0,2}?c{1,2}|.|.)B)+b", "cBaaac", null);
+    try expectSpanOpts("(?:(a|b\\1)x)+", "axBAx", .{ 0, 5 }, .{ .ignore_case = true });
+    try expectSpanOpts("(?:(a|b\\1)x)+", "axbx", .{ 0, 2 }, .{ .ignore_case = true, .utf8 = true });
+}

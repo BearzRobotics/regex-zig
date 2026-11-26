@@ -308,6 +308,11 @@ pub const Searcher = struct {
                     try s.setReg(r, pos);
                     pc += 1;
                 },
+                .close_group => |g| {
+                    try s.setReg(2 * g.group, s.regs[g.pending]);
+                    try s.setReg(2 * g.group + 1, pos);
+                    pc += 1;
+                },
                 .assertion => |a| if (context.check(a, hay, pos, search_start, s.prog.utf8)) {
                     pc += 1;
                 } else {

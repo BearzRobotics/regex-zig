@@ -27,6 +27,10 @@ pub const Inst = union(enum) {
     jmp: u32,
     /// regs[n] = current position (restored on backtrack).
     save: u32,
+    /// Backtracker only: capture group `group` closes. Publishes the start held
+    /// in regs[pending] and the current position together, so a
+    /// back-reference inside the group still sees the previous capture.
+    close_group: struct { group: u32, pending: u32 },
     assertion: ast.Assertion,
     backref: struct { index: u32, ignore_case: bool },
     /// Push a barrier; the body runs as an atomic unit.
@@ -183,9 +187,18 @@ const Compiler = struct {
             .repeat => |r| try c.compileRepeat(r),
             .group => |g| {
                 if (g.index) |i| {
-                    _ = try c.emit(.{ .save = 2 * i });
-                    try c.compile(g.sub);
-                    _ = try c.emit(.{ .save = 2 * i + 1 });
+                    if (c.nfa) {
+                        // No back-references here, so nothing can observe a
+                        // half-written capture.
+                        _ = try c.emit(.{ .save = 2 * i });
+                        try c.compile(g.sub);
+                        _ = try c.emit(.{ .save = 2 * i + 1 });
+                    } else {
+                        const pending = 2 * (c.group_count + 1) + (i - 1);
+                        _ = try c.emit(.{ .save = pending });
+                        try c.compile(g.sub);
+                        _ = try c.emit(.{ .close_group = .{ .group = i, .pending = pending } });
+                    }
                 } else try c.compile(g.sub);
             },
             .atomic => |sub| {
@@ -445,7 +458,8 @@ const Compiler = struct {
         var slot: ?u32 = null;
         // The Pike VM needs no guard: its visited set stops empty loops.
         if (!c.nfa and canBeEmpty(r.sub)) {
-            slot = 2 * (c.group_count + 1) + c.loop_slots;
+            // After the captures and the pending group starts.
+            slot = 2 * (c.group_count + 1) + c.group_count + c.loop_slots;
             c.loop_slots += 1;
             _ = try c.emit(.{ .mark = slot.? });
         }
@@ -792,7 +806,7 @@ pub fn compile(gpa: std.mem.Allocator, parsed: parse.Parsed, limits: parse.Limit
         .sets = bt.sets,
         .cp_sets = bt.cp_sets,
         .group_count = parsed.group_count,
-        .reg_count = 2 * (parsed.group_count + 1) + bt.loop_slots,
+        .reg_count = 2 * (parsed.group_count + 1) + parsed.group_count + bt.loop_slots,
         .names = names,
         .utf8 = settings.utf8,
         .longest = settings.longest,
