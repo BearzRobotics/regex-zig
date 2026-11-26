@@ -570,6 +570,8 @@ const Parser = struct {
             const q = (try p.tryQuantifier()) orelse break;
             if (count > 0 and (p.dialect == .perl or p.dialect == .rust))
                 return p.fail(error.InvalidPattern, qpos, "nested quantifier");
+            // A comment may also separate a quantifier from its `?` or `+`.
+            p.skipBeforeQuantifier();
             var greed: ast.Greed = .greedy;
             if (p.posix()) {
                 // No lazy or possessive forms: a following `?` or `+` is

@@ -1906,6 +1906,7 @@ test "perl: comments may stand before a quantifier" {
     try expectSpan("a(?#c){2}", "aaa", .{ 0, 2 });
     try expectSpan("(?x)a (?#c) +b", "aaab", .{ 0, 4 });
     try expectSpan("a+(?#c)(?#d)b", "aab", .{ 0, 3 });
+    try expectSpan("a+(?#c)?", "aaa", .{ 0, 1 }); // lazy, as in Perl
     try expectCompileError("(?#c)*", .{}, error.InvalidPattern);
     try expectCompileError("a(?#c", .{}, error.InvalidPattern);
 }
