@@ -459,16 +459,19 @@ const Parser = struct {
             '{' => {
                 const save = p.pos;
                 p.pos += 1;
-                const lo = p.number();
+                const lo = p.boundNumber();
                 var hi: ?u32 = lo;
                 var has_comma = false;
                 if (p.eat(',')) {
                     has_comma = true;
-                    hi = p.number();
+                    hi = p.boundNumber();
                 }
                 const closed = p.eat('}');
                 const valid = closed and (lo != null or (has_comma and hi != null and p.dialect == .oniguruma));
                 if (!valid) {
+                    // The Rust syntax has no literal '{'.
+                    if (p.dialect == .rust)
+                        return p.fail(error.InvalidPattern, save, "invalid repetition; write \\{ for a literal brace");
                     p.pos = save;
                     return null;
                 }
@@ -515,6 +518,14 @@ const Parser = struct {
         if (min > p.limits.max_repeat or (max orelse 0) > p.limits.max_repeat)
             return p.fail(error.LimitExceeded, save, "repeat count too large");
         return .{ .min = min, .max = max, .braces = true };
+    }
+
+    /// A number inside `{...}`. Rust's extended mode allows space around it.
+    fn boundNumber(p: *Parser) ?u32 {
+        if (p.dialect == .rust) p.skipExtended();
+        const n = p.number();
+        if (p.dialect == .rust) p.skipExtended();
+        return n;
     }
 
     fn number(p: *Parser) ?u32 {
@@ -921,8 +932,15 @@ const Parser = struct {
             return try p.classNode(&cls);
         }
         switch (c) {
-            'b' => return try p.node(.{ .assertion = .word_boundary }),
+            'b' => {
+                if (p.dialect == .rust) if (try p.specialWordBoundary(at)) |a|
+                    return try p.node(.{ .assertion = a });
+                return try p.node(.{ .assertion = .word_boundary });
+            },
             'B' => return try p.node(.{ .assertion = .not_word_boundary }),
+            // Word start and end in Rust; elsewhere the characters themselves.
+            '<' => if (p.dialect == .rust) return try p.node(.{ .assertion = .word_start }),
+            '>' => if (p.dialect == .rust) return try p.node(.{ .assertion = .word_end }),
             'A' => return try p.node(.{ .assertion = .text_start }),
             'z' => return try p.node(.{ .assertion = .text_end }),
             'Z' => return try p.node(.{ .assertion = .text_end_or_final_newline }),
@@ -963,6 +981,23 @@ const Parser = struct {
         }
         if (try p.byteEscape(c, at)) |cp| return try p.literalCp(cp);
         return p.fail(error.InvalidPattern, at, "unknown escape sequence");
+    }
+
+    /// Rust's `\b{start}` and `\b{end}`; the cursor is just past the `b`. Null
+    /// when no name follows, so a `{` there is an ordinary repetition.
+    fn specialWordBoundary(p: *Parser, at: usize) Error!?ast.Assertion {
+        if (p.pos + 1 >= p.src.len or p.src[p.pos] != '{') return null;
+        const first = p.src[p.pos + 1];
+        if (!std.ascii.isAlphabetic(first) and first != '-') return null;
+        const close = std.mem.indexOfScalarPos(u8, p.src, p.pos, '}') orelse
+            return p.fail(error.InvalidPattern, at, "unterminated \\b{...}");
+        const name = p.src[p.pos + 1 .. close];
+        p.pos = close + 1;
+        if (std.mem.eql(u8, name, "start")) return .word_start;
+        if (std.mem.eql(u8, name, "end")) return .word_end;
+        if (std.mem.eql(u8, name, "start-half") or std.mem.eql(u8, name, "end-half"))
+            return p.fail(error.Unsupported, at, "\\b{start-half} and \\b{end-half} are not supported");
+        return p.fail(error.InvalidPattern, at, "unknown \\b{...} assertion");
     }
 
     /// An escape in POSIX ERE (GNU flavour): word and space classes, word
@@ -1069,6 +1104,12 @@ const Parser = struct {
         while (p.setOpAhead()) |op| {
             p.pos += 2;
             var rhs = try p.parseClassSeq(open, false);
+            // Case variants belong to the operands: under (?i), `[a-z--k]`
+            // removes `k` and `K`, and `[a&&A]` is not empty.
+            if (p.flags.ignore_case) {
+                try p.classFoldCase(&cls);
+                try p.classFoldCase(&rhs);
+            }
             cls = try p.classSetOp(op, &cls, &rhs);
         }
         if (!p.eat(']')) return p.fail(error.InvalidPattern, open, "unterminated character class");
@@ -1107,9 +1148,13 @@ const Parser = struct {
             if (c == '&' and !p.posix() and p.startsWith("&&"))
                 return p.fail(error.Unsupported, p.pos, "class intersection &&");
 
-            const lo = (try p.classItem(&cls)) orelse continue;
+            const lo = (try p.classItem(&cls)) orelse {
+                if (p.dialect == .rust and p.rangeAhead())
+                    return p.fail(error.InvalidPattern, p.pos, "a class cannot start a range");
+                continue;
+            };
             // Range? The '-' is one byte, so test the byte after it.
-            if (p.peek() == '-' and p.pos + 1 < p.src.len and p.src[p.pos + 1] != ']' and !(p.dialect == .rust and p.startsWith("--"))) {
+            if (p.rangeAhead()) {
                 const save = p.pos;
                 p.pos += 1;
                 const nxt = p.peek().?;
@@ -1124,6 +1169,7 @@ const Parser = struct {
                 }
                 var scratch: Class = .{};
                 const hi = (try p.classItem(&scratch)) orelse {
+                    if (p.dialect == .rust) return p.fail(error.InvalidPattern, save, "a class cannot end a range");
                     // Range to a class escape like [a-\d]: treat '-' literally.
                     try p.classAddCp(&cls, lo);
                     try p.classAddCp(&cls, '-');
@@ -1135,6 +1181,13 @@ const Parser = struct {
             } else try p.classAddCp(&cls, lo);
         }
         return cls;
+    }
+
+    /// A '-' that makes a range with what follows: not last in the class and
+    /// not the Rust `--` operator.
+    fn rangeAhead(p: *Parser) bool {
+        return p.peek() == '-' and p.pos + 1 < p.src.len and p.src[p.pos + 1] != ']' and
+            !(p.dialect == .rust and p.startsWith("--"));
     }
 
     /// At a '[' inside a class: reports a collating symbol `[.x.]` or an
@@ -1176,6 +1229,8 @@ const Parser = struct {
             try p.classUnion(cls, found);
             return null;
         }
+        if (p.dialect == .rust and (e == 'b' or e == '<' or e == '>'))
+            return p.fail(error.InvalidPattern, at, "an assertion cannot be in a class");
         if (e == 'b') return 0x08; // \b inside a class is backspace
         if (e == 'p' or e == 'P') {
             try p.classUnion(cls, try p.propertyClass(e == 'P', at));

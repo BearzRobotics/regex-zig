@@ -1836,3 +1836,34 @@ test "posix bracket expressions: '[' and '&&' are ordinary members" {
     try expectCompileError("[[.a.]]", .{}, error.Unsupported);
     try expectSpanOpts("[[.a.]]", ".", .{ 0, 1 }, .{ .dialect = .rust });
 }
+
+test "rust: word start and end assertions" {
+    for ([_][]const u8{ "\\<foo\\>", "\\b{start}foo\\b{end}" }) |p| {
+        try expectSpanOpts(p, "a foo b", .{ 2, 5 }, rust);
+        try expectSpanOpts(p, "<foo>", .{ 1, 4 }, rust);
+        try expectSpanOpts(p, "xfoo foox", null, rust);
+    }
+    try expectSpanOpts("\\b{1}foo", "a foo", .{ 2, 5 }, rust); // a repetition, as in the crate
+    try expectCompileError("\\b{start-half}a", rust, error.Unsupported);
+    try expectCompileError("\\b{foo}", rust, error.InvalidPattern);
+    try expectCompileError("\\b{start", rust, error.InvalidPattern);
+    // Perl keeps `\<` as the character.
+    try expectSpan("\\<a\\>", "<a>", .{ 0, 3 });
+}
+
+test "rust: malformed braces and class boundaries are errors, as in the crate" {
+    for ([_][]const u8{ "a{", "{", "a{x}", "a{,3}", "a{1", "[a-\\d]", "[\\d-z]", "[\\b]", "[\\<]", "[\\>]" }) |p|
+        try expectCompileError(p, rust, error.InvalidPattern);
+    try expectSpanOpts("a\\{[{]}", "a{{}", .{ 0, 4 }, rust);
+    try expectSpanOpts("(?x)a{ 2 , 3 }", "aaaa", .{ 0, 3 }, rust);
+    try expectSpanOpts("[\\d-]+", "1-2", .{ 0, 3 }, rust);
+}
+
+test "rust: case folding applies to the operands of set operations" {
+    try expectSpanOpts("(?i)[a-z--K]", "kKa", .{ 2, 3 }, rust);
+    try expectSpanOpts("(?i)[a&&A]", "xa", .{ 1, 2 }, rust);
+    try expectSpanOpts("(?i)[a-c&&B]", "b", .{ 0, 1 }, rust);
+    try expectSpanOpts("(?i)[^a&&A]", "aAb", .{ 2, 3 }, rust);
+    try expectSpanOpts("(?i)[[a-z]--[A-Z]]", "q", null, rust);
+    try expectSpanOpts("(?i)[a-b~~B-C]+", "abBcC", .{ 0, 1 }, rust);
+}
