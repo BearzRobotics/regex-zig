@@ -2,10 +2,16 @@
 //! Convenience operations built on Searcher.find: iteration, counting,
 //! replacement and splitting. They are re-exported as Searcher methods.
 //!
-//! Empty matches: after an empty match the next search starts one byte later,
-//! so every position is tried once and the iteration always terminates. This
-//! is the Rust `regex` rule. It differs from Perl only for patterns that can
-//! match both empty and non-empty at one position (`|a` on "a").
+//! Empty matches: after an empty match the next search starts one byte later
+//! (one character later in utf8 mode), so the iteration always terminates.
+//! After a non-empty match it starts where that match ended, and an empty
+//! match there is reported: `x*` on "axxb" gives 0..0, 1..3, 3..3, 4..4.
+//!
+//! This applies to every dialect, including `.rust`. The Rust `regex` crate
+//! differs: it skips an empty match at the end of the previous match (3..3
+//! above). Perl differs for patterns that can match both empty and non-empty
+//! at one position: after the empty match it also tries for a non-empty one
+//! there (`|a` on "a").
 
 const std = @import("std");
 const backtrack = @import("backtrack.zig");
@@ -64,9 +70,9 @@ pub fn findAll(s: *Searcher, gpa: std.mem.Allocator, hay: []const u8) MatchError
     return out.toOwnedSlice(gpa);
 }
 
-/// The pieces of `hay` between matches (Rust `split` rules: an empty match at
-/// either end yields an empty first or last piece). The pieces borrow `hay`;
-/// the caller owns the returned slice.
+/// The pieces of `hay` between the matches `matches` finds (see the module
+/// comment for empty matches). A match at either end gives an empty first or
+/// last piece. The pieces borrow `hay`; the caller owns the returned slice.
 pub fn split(s: *Searcher, gpa: std.mem.Allocator, hay: []const u8) MatchError![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(gpa);

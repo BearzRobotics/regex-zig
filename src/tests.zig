@@ -370,6 +370,7 @@ test "isMatch and count" {
     }.f);
 }
 
+// Not the Rust crate's rule, which would skip the empty match at 3 (ops.zig).
 test "iteration over empty matches terminates and covers every position" {
     try withSearcher("x*", .{}, struct {
         fn f(s: *regex.Searcher) anyerror!void {
@@ -381,6 +382,12 @@ test "iteration over empty matches terminates and covers every position" {
             try std.testing.expectEqual(@as(usize, 4), spans.len);
             try std.testing.expectEqual(@as(usize, 1), spans[1].start);
             try std.testing.expectEqual(@as(usize, 3), spans[1].end);
+            try std.testing.expectEqual(@as(usize, 3), spans[2].start);
+            try std.testing.expectEqual(@as(usize, 3), spans[2].end);
+            const parts = try s.split(gpa, "axxb");
+            defer gpa.free(parts);
+            for ([_][]const u8{ "", "a", "", "b", "" }, parts) |want, got|
+                try std.testing.expectEqualStrings(want, got);
             try std.testing.expectEqual(@as(usize, 0), try s.count("") - 1);
         }
     }.f);

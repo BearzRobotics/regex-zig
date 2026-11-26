@@ -19,4 +19,5 @@ Back-references (`\1`, `\k<n>`), look-around, atomic groups, comments `(?#...)`,
 
 - `\b{start}`-style word-boundary variants and the `(?R)` CRLF flag are not supported.
 - Unicode mode is chosen with `Options.utf8`, not per pattern with `(?u)`; `(?u)` is accepted and has no effect.
+- Iteration (`matches`, `findAll`, `count`, `split`, `replaceAll`) reports an empty match at the end of the previous match; the crate skips it. `x*` on `axxb` gives `0..0`, `1..3`, `3..3`, `4..4` here and not `3..3` in the crate. This is the same in every dialect.
 - Case-insensitive matching uses Unicode simple case folding, as in the crate.
