@@ -412,7 +412,7 @@ test "replaceAll expands numbered and named groups" {
 test "replaceAll rejects bad templates even without matches" {
     try withSearcher("(a)", .{}, struct {
         fn f(s: *regex.Searcher) anyerror!void {
-            for ([_][]const u8{ "$", "$x", "$2", "${nope}", "${1", "${}" }) |bad|
+            for ([_][]const u8{ "$", "$x", "$2", "${nope}", "${1", "${}", "${+1}", "${-0}", "${0_1}", "${99999999999}" }) |bad|
                 try std.testing.expectError(error.InvalidReplacement, s.replaceAll(gpa, "zzz", bad));
         }
     }.f);
@@ -1919,4 +1919,14 @@ test "perl: multi-digit escapes are octal unless that many groups are open" {
     try expectCompileError("(a)\\2", .{}, error.InvalidPattern);
     try expectCompileError("\\89", .{}, error.InvalidPattern);
     try expectCompileError("\\400", .{}, error.Unsupported); // needs utf8
+}
+
+test "malformed numbers and group names are errors" {
+    for ([_][]const u8{ "\\x{+41}", "\\x{-0}", "\\x{_41}", "\\x{41_}", "\\x{}", "(?<1>a)", "(?'2x'a)", "(?P<3>a)" }) |p|
+        try expectCompileError(p, .{}, error.InvalidPattern);
+    try expectSpan("\\x{4_1}", "A", .{ 0, 1 }); // as in Perl
+    try expectCompileError("\\x{4_1}", rust, error.InvalidPattern);
+    // Duplicate names: an error in the Rust syntax, allowed in Perl.
+    try expectCompileError("(?<n>a)(?<n>b)", rust, error.InvalidPattern);
+    try expectSpan("(?<n>a)(?<n>b)\\k<n>", "aba", .{ 0, 3 });
 }

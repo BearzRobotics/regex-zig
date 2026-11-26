@@ -109,7 +109,13 @@ fn nextPiece(s: *const Searcher, repl: []const u8, i: *usize) error{InvalidRepla
         i.* += n + 1;
     }
     if (body.len == 0) return error.InvalidReplacement;
-    const group = if (std.fmt.parseInt(u32, body, 10)) |g| g else |_| blk: {
+    // Digits only: parseInt would also take a sign or `_`.
+    const numeric = for (body) |c| {
+        if (!std.ascii.isDigit(c)) break false;
+    } else true;
+    const group = if (numeric)
+        std.fmt.parseInt(u32, body, 10) catch return error.InvalidReplacement
+    else blk: {
         for (s.prog.names) |nm| if (std.mem.eql(u8, nm.name, body)) break :blk nm.index;
         return error.InvalidReplacement;
     };

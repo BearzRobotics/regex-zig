@@ -747,6 +747,12 @@ const Parser = struct {
         if (p.pos == start or !p.eat(close))
             return p.fail(error.InvalidPattern, open, "malformed group name");
         const name = p.src[start .. p.pos - 1];
+        // `${1}` in a replacement is a group number, so no name may look like one.
+        if (std.ascii.isDigit(name[0]))
+            return p.fail(error.InvalidPattern, start, "a group name cannot start with a digit");
+        // Perl and Oniguruma allow a name twice; references use the first.
+        if (p.dialect == .rust) for (p.names.items) |n| if (std.mem.eql(u8, n.name, name))
+            return p.fail(error.InvalidPattern, start, "duplicate group name");
         p.group_count += 1;
         try p.names.append(p.arena, .{ .name = name, .index = p.group_count });
         return p.finishGroup(open, .{ .capture = p.group_count }, saved);
@@ -865,6 +871,10 @@ const Parser = struct {
     /// A single-character escape (after the backslash): \n \t \xHH \x{H..} \0oo and
     /// escaped punctuation. A byte in byte mode, a scalar value in utf8 mode. The cursor is just past the escape letter.
     fn scalarFromHex(p: *Parser, digits: []const u8, at: usize) Error!u21 {
+        // parseInt would also take a sign, and `_` between digits, which Perl
+        // allows but the Rust syntax does not.
+        for (digits) |d| if (!std.ascii.isHex(d) and !(d == '_' and p.dialect != .rust))
+            return p.fail(error.InvalidPattern, at, "invalid hexadecimal escape");
         const v = std.fmt.parseInt(u32, digits, 16) catch
             return p.fail(error.InvalidPattern, at, "invalid hexadecimal escape");
         if (p.utf8) {
