@@ -61,6 +61,13 @@ conditionals, recursion, callouts.
   No literal-prefix or required-substring optimisation yet.
 - No linear-time engine yet (SPEC §2.2 is not met by this slice).
 
+## Known engine difference
+
+For a repeated group that can match empty and prefers to, the default engine can
+choose a different match from Perl: `(\w{0,2}?)+b` on `cbb` gives `0..3`, Perl
+`0..2`. `engine = .backtrack` gives Perl's result. See
+`docs/decisions/0002-matching-engines.md`, section 4.
+
 ## Tests
 
 `zig build test` — 28 tests including limits, allocation failure and

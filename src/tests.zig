@@ -1990,3 +1990,12 @@ test "regex set: diagnostics name the pattern at fault, or the whole set" {
     try std.testing.expectError(error.LimitExceeded, regex.RegexSet.compile(gpa, &.{ "a", "(?:b{900}){2}", "c" }, limits, &diag));
     try std.testing.expectEqual(@as(usize, 1), diag.pattern);
 }
+
+// A known difference, not a wanted one (ADR 0002, section 4). If a change makes
+// the engines agree, update the ADR and perl.md and turn this into a check that
+// all engines give Perl's 0..2.
+test "known deviation: a lazy loop body that can match empty" {
+    const p = "(\\w{0,2}?)+b";
+    try expectSpanOpts(p, "cbb", .{ 0, 2 }, .{ .engine = .backtrack });
+    try expectSpanOpts(p, "cbb", .{ 0, 3 }, .{ .engine = .pike });
+}
