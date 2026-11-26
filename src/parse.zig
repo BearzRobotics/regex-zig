@@ -473,9 +473,9 @@ const Parser = struct {
                 const closed = p.eat('}');
                 // `{,n}` is `{0,n}`; GNU also reads `{,}` as `*`.
                 const open_lower = switch (p.dialect) {
-                    .oniguruma => has_comma and hi != null,
+                    .perl, .oniguruma => has_comma and hi != null,
                     .posix_ere => has_comma,
-                    .perl, .posix_bre, .rust => false,
+                    .posix_bre, .rust => false,
                 };
                 const valid = closed and (lo != null or open_lower);
                 if (!valid) {
@@ -548,11 +548,24 @@ const Parser = struct {
         return if (p.pos == start) null else @intCast(v);
     }
 
+    /// Skips what may stand between an atom and its quantifier: `(?#...)`
+    /// comments in the Perl family, and extended-mode space.
+    fn skipBeforeQuantifier(p: *Parser) void {
+        while (true) {
+            p.skipExtended();
+            if (p.dialect != .perl and p.dialect != .oniguruma) return;
+            if (!p.startsWith("(?#")) return;
+            // An unterminated comment is left for parseGroup to report.
+            const close = std.mem.indexOfScalarPos(u8, p.src, p.pos, ')') orelse return;
+            p.pos = close + 1;
+        }
+    }
+
     fn parseQuantifiers(p: *Parser, atom: *const Node) Error!*const Node {
         var cur = atom;
         var count: u32 = 0;
         while (true) {
-            p.skipExtended();
+            p.skipBeforeQuantifier();
             const qpos = p.pos;
             const q = (try p.tryQuantifier()) orelse break;
             if (count > 0 and (p.dialect == .perl or p.dialect == .rust))
@@ -983,6 +996,9 @@ const Parser = struct {
             '1'...'9' => {
                 p.pos -= 1;
                 const n = p.number().?;
+                // As in Perl: \10 and up refer to a group only if that many
+                // have been opened, and are otherwise an octal escape.
+                if (n >= 10 and n > p.group_count and c <= '7') return try p.octalEscape(at);
                 if (n > p.max_backref) {
                     p.max_backref = n;
                     p.backref_pos = at;
@@ -993,6 +1009,21 @@ const Parser = struct {
         }
         if (try p.byteEscape(c, at)) |cp| return try p.literalCp(cp);
         return p.fail(error.InvalidPattern, at, "unknown escape sequence");
+    }
+
+    /// Up to three octal digits after the backslash at `at`; any digits after
+    /// them are ordinary characters.
+    fn octalEscape(p: *Parser, at: usize) Error!*const Node {
+        p.pos = at + 1;
+        var v: u32 = 0;
+        while (p.pos < p.src.len and p.pos - at <= 3) : (p.pos += 1) {
+            const d = p.src[p.pos];
+            if (d < '0' or d > '7') break;
+            v = v * 8 + (d - '0');
+        }
+        if (!p.utf8 and v > 0xff)
+            return p.fail(error.Unsupported, at, "code point above 0xFF (enable utf8 for Unicode matching)");
+        return p.literalCp(@intCast(v));
     }
 
     /// Rust's `\b{start}` and `\b{end}`; the cursor is just past the `b`. Null

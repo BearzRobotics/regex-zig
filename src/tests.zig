@@ -95,7 +95,8 @@ test "quantifiers: greedy, lazy, possessive, counted" {
     try expectSpan("a?b", "b", .{ 0, 1 });
     try expectSpan("a*+a", "aaa", null);
     try expectSpan("a++b", "aaab", .{ 0, 4 });
-    try expectSpan("x{,2}", "x{,2}", .{ 0, 5 }); // Perl: literal braces
+    try expectSpan("x{,2}", "xxx", .{ 0, 2 }); // Perl 5.34 and later
+    try expectSpan("x{,}", "x{,}", .{ 0, 4 }); // still literal in Perl
 }
 
 test "literal braces" {
@@ -111,7 +112,9 @@ test "classes" {
     try expectSpan("[\\d_]+", "ab12_3c", .{ 2, 6 });
     try expectSpan("[[:alpha:]]+", "12abC3", .{ 2, 5 });
     try expectSpan("[[:^alpha:]]+", "ab12c", .{ 2, 4 });
-    try expectSpan("[a[bc]]+", "xbcax", .{ 1, 4 }); // Oniguruma nested class
+    // Nested classes are Oniguruma syntax. `.perl` accepts them too, unlike
+    // Perl (docs/compatibility/perl.md).
+    try expectSpan("[a[bc]]+", "xbcax", .{ 1, 4 });
     try expectSpan("\\w+", "  foo_1 ", .{ 2, 7 });
     try expectSpan("\\S+", "  ab ", .{ 2, 4 });
 }
@@ -1896,4 +1899,23 @@ test "rust: case folding applies to the operands of set operations" {
     try expectSpanOpts("(?i)[^a&&A]", "aAb", .{ 2, 3 }, rust);
     try expectSpanOpts("(?i)[[a-z]--[A-Z]]", "q", null, rust);
     try expectSpanOpts("(?i)[a-b~~B-C]+", "abBcC", .{ 0, 1 }, rust);
+}
+
+test "perl: comments may stand before a quantifier" {
+    try expectSpan("a(?#c)*b", "aaab", .{ 0, 4 });
+    try expectSpan("a(?#c){2}", "aaa", .{ 0, 2 });
+    try expectSpan("(?x)a (?#c) +b", "aaab", .{ 0, 4 });
+    try expectSpan("a+(?#c)(?#d)b", "aab", .{ 0, 3 });
+    try expectCompileError("(?#c)*", .{}, error.InvalidPattern);
+    try expectCompileError("a(?#c", .{}, error.InvalidPattern);
+}
+
+test "perl: multi-digit escapes are octal unless that many groups are open" {
+    try expectSpan("\\101", "xA", .{ 1, 2 });
+    try expectSpan("(a)\\10", "a\x08", .{ 0, 2 });
+    try expectSpan("\\18", "\x018", .{ 0, 2 });
+    try expectSpan("(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)\\10", "abcdefghijj", .{ 0, 11 });
+    try expectCompileError("(a)\\2", .{}, error.InvalidPattern);
+    try expectCompileError("\\89", .{}, error.InvalidPattern);
+    try expectCompileError("\\400", .{}, error.Unsupported); // needs utf8
 }
